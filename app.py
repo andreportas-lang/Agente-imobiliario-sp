@@ -32,7 +32,8 @@ def instanciar_llm(provedor: str, modelo: str, api_key: str):
     if provedor == "OpenAI":
         return ChatOpenAI(model=modelo, api_key=api_key, temperature=0)
     elif provedor == "Anthropic":
-        return ChatAnthropic(model=modelo, api_key=api_key, temperature=0, max_tokens=1024)
+        # Removido o temperature=0 pois a API da Anthropic passou a rejeitá-lo como "input extra"
+        return ChatAnthropic(model=modelo, api_key=api_key, max_tokens=1024)
 
 def limpar_numero(valor, padrao=0):
     """Garante que qualquer lixo em texto (ex: 'R$ 1.200.000', '1.2Mi') vire um inteiro."""
