@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import streamlit as st
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, START, END
@@ -48,7 +49,7 @@ def instanciar_llm(provedor: str, modelo: str, api_key: str):
 # 3. NÓS DO GRAFO
 # ==========================================
 def node_extrator(state: AgentState):
-    """Extrai os dados forçando números inteiros rigorosos."""
+    """Extrai os dados mantendo a memória dos parâmetros anteriores e blindando o JSON."""
     llm = instanciar_llm(
         st.session_state.provedor_fast, 
         st.session_state.fast_model, 
@@ -57,33 +58,55 @@ def node_extrator(state: AgentState):
     
     ultima_msg = state["messages"][-1]["content"]
     
-    sys_msg = SystemMessage(content="""
-    Extraia as informações do pedido do usuário e retorne APENAS um JSON válido.
-    Formato OBRIGATÓRIO (sem texto antes ou depois):
-    {
-      "bairro": "Nome do bairro",
-      "valor_max": 1200000, 
+    # 1. Recupera o que já tínhamos salvo antes para o agente não sofrer amnésia!
+    params_atuais = state.get("parametros", {"bairro": "Não definido", "valor_max": 0, "entrada": 0})
+    if not params_atuais: # Caso venha nulo do estado inicial
+        params_atuais = {"bairro": "Não definido", "valor_max": 0, "entrada": 0}
+        
+    sys_msg = SystemMessage(content=f"""
+    Você é um extrator de dados JSON.
+    O usuário acabou de mandar uma nova mensagem. Atualize os parâmetros atuais se ele informou algo novo.
+    
+    PARÂMETROS ATUAIS SALVOS:
+    {json.dumps(params_atuais, ensure_ascii=False)}
+    
+    Regras:
+    - Se o usuário informou um bairro, valor ou entrada NOVO, atualize.
+    - Se a nova mensagem NÃO tem esses dados, MANTENHA os dados do JSON acima intactos.
+    - Se não achar um dado e ele estiver vazio, use 0 para números e 'Não definido' para bairro.
+    - Converta valores informados (ex: 1.2Mi, 300k) para NÚMEROS INTEIROS (ex: 1200000, 300000).
+    
+    Retorne APENAS o JSON final resultante:
+    {{
+      "bairro": "nome do bairro",
+      "valor_max": 1200000,
       "entrada": 300000
-    }
-    ATENÇÃO: 'valor_max' e 'entrada' DEVEM ser NÚMEROS INTEIROS PUROS. 
-    Se não achar o valor, retorne 0. Se não achar o bairro, retorne 'Não definido'.
+    }}
     """)
     
     try:
         resposta = llm.invoke([sys_msg, HumanMessage(content=ultima_msg)])
-        texto_limpo = resposta.content.strip().replace("```json", "").replace("```", "")
-        parametros_dict = json.loads(texto_limpo)
+        texto_bruto = resposta.content.strip()
+        
+        # 2. Blindagem: Expressão Regular para extrair só o que está entre { e }
+        match = re.search(r'\{.*\}', texto_bruto, re.DOTALL)
+        if match:
+            texto_json = match.group(0)
+        else:
+            texto_json = texto_bruto # Tenta usar tudo se não achar as chaves
+            
+        parametros_dict = json.loads(texto_json)
         
         state["parametros"] = {
-            "bairro": parametros_dict.get("bairro", "Não definido"),
-            "valor_max": int(parametros_dict.get("valor_max", 0)),
-            "entrada": int(parametros_dict.get("entrada", 0))
+            "bairro": parametros_dict.get("bairro", params_atuais["bairro"]),
+            "valor_max": int(parametros_dict.get("valor_max", params_atuais["valor_max"])),
+            "entrada": int(parametros_dict.get("entrada", params_atuais["entrada"]))
         }
         
     except Exception as e:
-        # Simplificado para evitar UnboundLocalError caso 'resposta' não exista
-        print(f"Erro na extração JSON ou falha na API: {e}")
-        state["parametros"] = {"bairro": "Não definido", "valor_max": 0, "entrada": 0}
+        # 3. Se falhar, mantém o que já sabíamos (preserva a memória)
+        print(f"Erro no parser: {e} | Resposta bruta: {resposta.content if 'resposta' in locals() else 'Nenhuma'}")
+        state["parametros"] = params_atuais
         
     state["tentativas_busca"] = state.get("tentativas_busca", 0) + 1
     return state
