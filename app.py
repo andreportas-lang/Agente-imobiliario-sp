@@ -14,6 +14,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 # 1. ESTRUTURAS DE DADOS (PYDANTIC E ESTADO)
 # ==========================================
 class ParametrosBusca(BaseModel):
+    """Extrai os parâmetros de busca de imóveis fornecidos pelo usuário na conversa."""
     bairro: str = Field(description="Bairro de São Paulo desejado. Retorne 'Não definido' se não informado.")
     valor_max: int = Field(description="Valor máximo do imóvel em reais. Use 0 se não informado.")
     entrada: int = Field(description="Valor disponível para entrada em reais. Use 0 se não informado.")
@@ -38,7 +39,8 @@ def instanciar_llm(provedor: str, modelo: str, api_key: str):
     if provedor == "OpenAI":
         return ChatOpenAI(model=modelo, api_key=api_key, temperature=0)
     elif provedor == "Anthropic":
-        return ChatAnthropic(model=modelo, api_key=api_key, temperature=0)
+        # A Anthropic exige o limite de tokens explícito para evitar Bad Request
+        return ChatAnthropic(model=modelo, api_key=api_key, temperature=0, max_tokens=1024)
 
 # ==========================================
 # 3. NÓS DO GRAFO
