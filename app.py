@@ -47,7 +47,7 @@ def instanciar_llm(provedor: str, modelo: str, api_key: str):
 # 3. NÓS DO GRAFO
 # ==========================================
 def node_extrator(state: AgentState):
-    """Usa um modelo rápido para extrair a intenção e os parâmetros da mensagem do usuário retornando JSON puro."""
+    """Extrai os dados forçando números inteiros rigorosos."""
     llm = instanciar_llm(
         st.session_state.provedor_fast, 
         st.session_state.fast_model, 
@@ -56,40 +56,41 @@ def node_extrator(state: AgentState):
     
     ultima_msg = state["messages"][-1]["content"]
     
-    # Prompt explícito pedindo JSON. Isso funciona em qualquer modelo perfeitamente.
+    # Prompt blindado contra erros de formatação numérica
     sys_msg = SystemMessage(content="""
     Extraia as informações do pedido do usuário e retorne APENAS um JSON válido.
-    Não adicione texto antes ou depois do JSON. Não use blocos de código (```json).
-    Use a seguinte estrutura:
+    Formato OBRIGATÓRIO (sem texto antes ou depois):
     {
-      "bairro": "Nome do bairro de SP. Se não informado, retorne 'Não definido'",
-      "valor_max": inteiro representando o valor máximo em reais (ex: 900000). Se não informado, retorne 0,
-      "entrada": inteiro representando o valor de entrada em reais (ex: 150000). Se não informado, retorne 0
+      "bairro": "Nome do bairro",
+      "valor_max": 1200000, 
+      "entrada": 300000
     }
+    ATENÇÃO: 'valor_max' e 'entrada' DEVEM ser NÚMEROS INTEIROS PUROS (sem aspas, sem pontos, sem vírgulas, sem R$, sem Mi ou K). 
+    Se não achar o valor, retorne 0. Se não achar o bairro, retorne 'Não definido'.
     """)
     
     try:
-        # Chama o LLM pedindo a resposta em texto bruto
         resposta = llm.invoke([sys_msg, HumanMessage(content=ultima_msg)])
         texto_limpo = resposta.content.strip().replace("```json", "").replace("```", "")
         
-        # Converte a string JSON para um dicionário Python
         parametros_dict = json.loads(texto_limpo)
         
-        # Opcional: passa pelo Pydantic para validar os tipos
-        validado = ParametrosBusca(**parametros_dict)
-        state["parametros"] = validado.model_dump()
+        # Garante a conversão caso o LLM ainda assim mande como string
+        state["parametros"] = {
+            "bairro": parametros_dict.get("bairro", "Não definido"),
+            "valor_max": int(parametros_dict.get("valor_max", 0)),
+            "entrada": int(parametros_dict.get("entrada", 0))
+        }
         
     except Exception as e:
-        # Fallback de segurança se o LLM falhar em gerar o JSON ou o usuário falar algo sem sentido
-        print(f"Falha ao extrair JSON: {e}")
+        print(f"Erro no parser JSON: {e} - Retorno do modelo: {resposta.content}")
         state["parametros"] = {"bairro": "Não definido", "valor_max": 0, "entrada": 0}
         
     state["tentativas_busca"] = state.get("tentativas_busca", 0) + 1
     return state
 
 def node_buscador_web(state: AgentState):
-    """Faz uma busca real na web usando DuckDuckGo em vez de API de imobiliária."""
+    """Busca mais orgânica para não acionar bloqueios do DuckDuckGo."""
     bairro = state["parametros"].get("bairro", "")
     valor_max = state["parametros"].get("valor_max", 0)
     
@@ -98,14 +99,26 @@ def node_buscador_web(state: AgentState):
         state["texto_busca_bruta"] = ""
         return state
 
-    # Query focada em pegar fragmentos de sites imobiliários conhecidos
-    query = f"apartamento {bairro} São Paulo comprar até R$ {valor_max} site:vivareal.com.br OR site:quintoandar.com.br"
+    # Simplificamos a query. Removido o 'OR' que quebrava o scraper do DDG
+    query = f"apartamento {bairro} São Paulo comprar site:vivareal.com.br"
     
-    buscador = DuckDuckGoSearchResults(max_results=5)
-    resultados = buscador.invoke(query)
-    
-    state["texto_busca_bruta"] = resultados
-    state["erro_busca"] = len(resultados) < 20 # Considera erro se não retornar texto suficiente
+    try:
+        buscador = DuckDuckGoSearchResults(max_results=5)
+        resultados = buscador.invoke(query)
+        
+        # O DDG costuma retornar frases de aviso em vez de lista vazia quando falha
+        if not resultados or "No good DuckDuckGo" in resultados or len(resultados) < 20:
+            state["erro_busca"] = True
+            state["texto_busca_bruta"] = ""
+        else:
+            state["texto_busca_bruta"] = resultados
+            state["erro_busca"] = False
+            
+    except Exception as e:
+        print(f"Erro na api de busca: {e}")
+        state["erro_busca"] = True
+        state["texto_busca_bruta"] = ""
+        
     return state
 
 def node_validador(state: AgentState):
@@ -223,6 +236,11 @@ with st.sidebar:
         
     st.markdown("---")
     st.caption("A extração de dados usa o modelo rápido (Haiku/Mini). A leitura da web e raciocínio financeiro usam o modelo pesado (Sonnet/GPT-4o).")
+    st.markdown("---")
+    st.subheader("🔍 Depuração de Estado")
+    st.write(st.session_state.graph_state.get("parametros", {}))
+    st.write("Erro na busca:", st.session_state.graph_state.get("erro_busca"))
+
 
 # --- LAYOUT PRINCIPAL (DUAS COLUNAS) ---
 col_chat, col_results = st.columns([1, 1.2], gap="large")
