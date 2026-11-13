@@ -38,9 +38,10 @@ def instanciar_llm(provedor: str, modelo: str, api_key: str):
         raise ValueError(f"Chave de API do {provedor} não configurada ou ausente no secrets.toml!")
     
     if provedor == "OpenAI":
+        # OpenAI não exige max_tokens obrigatoriamente
         return ChatOpenAI(model=modelo, api_key=api_key, temperature=0)
     elif provedor == "Anthropic":
-        # A Anthropic exige o limite de tokens explícito para evitar Bad Request
+        # Anthropic EXIGE o max_tokens. Sem isso, gera BadRequestError (400)
         return ChatAnthropic(model=modelo, api_key=api_key, temperature=0, max_tokens=1024)
 
 # ==========================================
@@ -56,7 +57,6 @@ def node_extrator(state: AgentState):
     
     ultima_msg = state["messages"][-1]["content"]
     
-    # Prompt blindado contra erros de formatação numérica
     sys_msg = SystemMessage(content="""
     Extraia as informações do pedido do usuário e retorne APENAS um JSON válido.
     Formato OBRIGATÓRIO (sem texto antes ou depois):
@@ -65,17 +65,15 @@ def node_extrator(state: AgentState):
       "valor_max": 1200000, 
       "entrada": 300000
     }
-    ATENÇÃO: 'valor_max' e 'entrada' DEVEM ser NÚMEROS INTEIROS PUROS (sem aspas, sem pontos, sem vírgulas, sem R$, sem Mi ou K). 
+    ATENÇÃO: 'valor_max' e 'entrada' DEVEM ser NÚMEROS INTEIROS PUROS. 
     Se não achar o valor, retorne 0. Se não achar o bairro, retorne 'Não definido'.
     """)
     
     try:
         resposta = llm.invoke([sys_msg, HumanMessage(content=ultima_msg)])
         texto_limpo = resposta.content.strip().replace("```json", "").replace("```", "")
-        
         parametros_dict = json.loads(texto_limpo)
         
-        # Garante a conversão caso o LLM ainda assim mande como string
         state["parametros"] = {
             "bairro": parametros_dict.get("bairro", "Não definido"),
             "valor_max": int(parametros_dict.get("valor_max", 0)),
@@ -83,7 +81,8 @@ def node_extrator(state: AgentState):
         }
         
     except Exception as e:
-        print(f"Erro no parser JSON: {e} - Retorno do modelo: {resposta.content}")
+        # Simplificado para evitar UnboundLocalError caso 'resposta' não exista
+        print(f"Erro na extração JSON ou falha na API: {e}")
         state["parametros"] = {"bairro": "Não definido", "valor_max": 0, "entrada": 0}
         
     state["tentativas_busca"] = state.get("tentativas_busca", 0) + 1
