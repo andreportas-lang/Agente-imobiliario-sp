@@ -1,4 +1,5 @@
 import os
+import json
 import streamlit as st
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, START, END
@@ -46,7 +47,7 @@ def instanciar_llm(provedor: str, modelo: str, api_key: str):
 # 3. NÓS DO GRAFO
 # ==========================================
 def node_extrator(state: AgentState):
-    """Usa um modelo rápido para extrair a intenção e os parâmetros da mensagem do usuário."""
+    """Usa um modelo rápido para extrair a intenção e os parâmetros da mensagem do usuário retornando JSON puro."""
     llm = instanciar_llm(
         st.session_state.provedor_fast, 
         st.session_state.fast_model, 
@@ -55,11 +56,35 @@ def node_extrator(state: AgentState):
     
     ultima_msg = state["messages"][-1]["content"]
     
-    # Força o modelo a retornar JSON estruturado usando Pydantic
-    llm_estruturado = llm.with_structured_output(ParametrosBusca)
-    resultado = llm_estruturado.invoke([HumanMessage(content=ultima_msg)])
+    # Prompt explícito pedindo JSON. Isso funciona em qualquer modelo perfeitamente.
+    sys_msg = SystemMessage(content="""
+    Extraia as informações do pedido do usuário e retorne APENAS um JSON válido.
+    Não adicione texto antes ou depois do JSON. Não use blocos de código (```json).
+    Use a seguinte estrutura:
+    {
+      "bairro": "Nome do bairro de SP. Se não informado, retorne 'Não definido'",
+      "valor_max": inteiro representando o valor máximo em reais (ex: 900000). Se não informado, retorne 0,
+      "entrada": inteiro representando o valor de entrada em reais (ex: 150000). Se não informado, retorne 0
+    }
+    """)
     
-    state["parametros"] = resultado.model_dump()
+    try:
+        # Chama o LLM pedindo a resposta em texto bruto
+        resposta = llm.invoke([sys_msg, HumanMessage(content=ultima_msg)])
+        texto_limpo = resposta.content.strip().replace("```json", "").replace("```", "")
+        
+        # Converte a string JSON para um dicionário Python
+        parametros_dict = json.loads(texto_limpo)
+        
+        # Opcional: passa pelo Pydantic para validar os tipos
+        validado = ParametrosBusca(**parametros_dict)
+        state["parametros"] = validado.model_dump()
+        
+    except Exception as e:
+        # Fallback de segurança se o LLM falhar em gerar o JSON ou o usuário falar algo sem sentido
+        print(f"Falha ao extrair JSON: {e}")
+        state["parametros"] = {"bairro": "Não definido", "valor_max": 0, "entrada": 0}
+        
     state["tentativas_busca"] = state.get("tentativas_busca", 0) + 1
     return state
 
