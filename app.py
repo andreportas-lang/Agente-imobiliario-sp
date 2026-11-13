@@ -196,7 +196,7 @@ if "graph_state" not in st.session_state:
         "resultados_estruturados": "", "analise_financeira": "", 
         "tentativas_busca": 0, "erro_busca": False, "erro_extracao": ""
     }
-
+    
 # --- BARRA LATERAL ---
 with st.sidebar:
     st.header("Configuração de IA")
@@ -211,11 +211,10 @@ with st.sidebar:
         st.session_state.fast_model = "gpt-4o-mini"
         st.session_state.provedor_reasoning = "OpenAI"
         st.session_state.reasoning_model = "gpt-4o"
-        else:
+    else:
         st.session_state.api_key = anthropic_key
         st.session_state.provedor_fast = "Anthropic"
-        # Usando a versão 3.5 mais recente do Haiku
-        st.session_state.fast_model = "claude-3-5-haiku-20241022" 
+        st.session_state.fast_model = "claude-3-5-haiku-20241022"
         st.session_state.provedor_reasoning = "Anthropic"
         st.session_state.reasoning_model = "claude-3-5-sonnet-20241022"
         
