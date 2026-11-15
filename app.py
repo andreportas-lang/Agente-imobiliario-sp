@@ -130,6 +130,7 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
             **kw,
         )
         text = r.choices[0].message.content or ""
+        stop = r.choices[0].finish_reason
         tin, tout = r.usage.prompt_tokens, r.usage.completion_tokens
     else:
         key = secret("ANTHROPIC_API_KEY")
@@ -144,11 +145,18 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
             messages=[{"role": "user", "content": user}],
         )
         text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
+        stop = f"{r.stop_reason} | blocos={[getattr(b, 'type', '?') for b in r.content]}"
         tin, tout = r.usage.input_tokens, r.usage.output_tokens
     state["llm_log"].append(
         {"nó": node, "modelo": f"{provider}:{model}", "tokens_in": tin, "tokens_out": tout,
-         "ms": round((time.perf_counter() - t0) * 1000), "resposta": text[:1500]}
+         "max_tokens": max_tokens, "parada": stop, "ms": round((time.perf_counter() - t0) * 1000),
+         "enviado_system": system, "enviado_user": user, "resposta": text[:1500]}
     )
+    if not text.strip():
+        raise RuntimeError(
+            f"Resposta vazia do LLM (parada={stop}; tokens_out={tout}/{max_tokens}). "
+            "Provável: o modelo gastou o limite de tokens 'pensando'. Aumente max_tokens ou troque o modelo."
+        )
     return text
 
 
@@ -231,7 +239,7 @@ def n_extract(s):
         "extras (texto curto com outras preferências, ex: aceita pet, andar alto). Use null para o que não foi informado."
     )
     try:
-        data = parse_json(llm(s, "extract", system, user, max_tokens=250, as_json=True))
+        data = parse_json(llm(s, "extract", system, user, max_tokens=1500, as_json=True))
     except Exception as e:
         s["errors"].append(f"[extract] fallback regex ({e})")
         data = {"intent": "busca", "valor_max": first_price(msg), "area_m2": first_area(msg)}
@@ -267,7 +275,7 @@ def n_answer(s):
     system = ("Você é um corretor de imóveis prestativo. Responda em português, curto e direto, usando apenas as "
               "opções fornecidas. Se faltar informação, diga que precisa confirmar no anúncio.")
     s["reply"] = llm(s, "answer", system, f"Opções atuais: {ctx}\nHistórico:\n{hist}\nPergunta: {s['user_msg']}",
-                     max_tokens=450)
+                     max_tokens=1500)
     return "resposta de acompanhamento"
 
 
@@ -369,7 +377,7 @@ def n_select(s):
             'Formato: {"opcoes":[{"id":int,"titulo":str,"preco":number|null,"area_m2":number|null,"quartos":number|null,'
             '"aderencia":0-100,"motivo":"1-2 frases","alertas":["itens a confirmar/divergências"]}]} '
             "ordenado por aderência. Ignore páginas de listagem genérica sem imóvel específico, a menos que não haja melhor.")
-    data = parse_json(llm(s, "select", system, user, max_tokens=1100, as_json=True))
+    data = parse_json(llm(s, "select", system, user, max_tokens=4000, as_json=True))
     out = []
     for o in data.get("opcoes", [])[:3]:
         i = o.get("id")
