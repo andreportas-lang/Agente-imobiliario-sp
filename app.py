@@ -43,6 +43,20 @@ SITES = {
 DEFAULT_MODELS = {"OpenAI": "gpt-4o-mini", "Claude": "claude-haiku-5-5"}
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 CACHE_TTL = 3600
+AREA_TOL_DOWN = 10   # tolerância máxima (m²) abaixo do tamanho pedido
+PRICE_TOL = 0.10     # tolerância de 10% acima do valor máximo
+# Só aceitamos URLs que apontam para UM imóvel (não páginas de busca/listagem)
+LISTING_RE = {
+    "quintoandar.com.br": r"/imovel/\d+",
+    "loft.com.br": r"/imovel/",
+    "vivareal.com.br": r"/imovel/",
+    "zapimoveis.com.br": r"/imovel/",
+    "imovelweb.com.br": r"/propriedades/",
+    "chavesnamao.com.br": r"/imovel/",
+    "olx.com.br": r"-\d{7,}(?:[/?#]|$)",
+}
+SITE_PATH = {"quintoandar.com.br": "/imovel", "loft.com.br": "/imovel", "vivareal.com.br": "/imovel",
+             "zapimoveis.com.br": "/imovel", "chavesnamao.com.br": "/imovel", "imovelweb.com.br": "/propriedades"}
 
 
 @st.cache_resource
@@ -62,12 +76,32 @@ def cached(key, fn, ttl=CACHE_TTL):
     return val, False
 
 
-def secret(name):
+def secret_info(name):
     try:
-        v = st.secrets.get(name)
+        v, src = st.secrets.get(name), "st.secrets"
     except Exception:
-        v = None
-    return v or os.environ.get(name)
+        v, src = None, ""
+    if not v:
+        v, src = os.environ.get(name), "variável de ambiente"
+    if isinstance(v, str):
+        v = v.strip().strip("\"'").strip()  # remove espaços/aspas coladas por engano
+    return (v, src) if v else (None, "")
+
+
+def secret(name):
+    return secret_info(name)[0]
+
+
+def hint(e):
+    """Dica amigável para erros comuns de API."""
+    code = getattr(e, "status_code", None)
+    msg = str(e)
+    if code == 401 or "401" in msg or "AuthenticationError" in type(e).__name__:
+        return (" → CHAVE RECUSADA (401): chave inválida, revogada ou de outro projeto/organização. "
+                "Veja 'Diagnóstico das chaves' na barra lateral.")
+    if code == 429 or "RateLimit" in type(e).__name__:
+        return " → limite de uso/crédito atingido (429)."
+    return ""
 
 
 # ----------------------------------------------------------------------------
@@ -99,7 +133,7 @@ class Graph:
                 nxt = self.edges.get(cur, "END")
                 nxt = nxt(state) if callable(nxt) else nxt
             except Exception as e:  # erro em um nó -> vai para "fail"
-                state["errors"].append(f"[{cur}] {type(e).__name__}: {e}")
+                state["errors"].append(f"[{cur}] {type(e).__name__}: {e}{hint(e)}")
                 note, nxt = f"ERRO: {e}", "fail"
                 if cur == "fail":
                     nxt = "END"
@@ -234,10 +268,51 @@ def brl(v):
     return "—" if v is None else "R$ " + f"{v:,.0f}".replace(",", ".")
 
 
+def prices(text):
+    out = []
+    for m in PRICE_RE.finditer(text or ""):
+        before = text[max(0, m.start() - 14):m.start()].lower()
+        if any(w in before for w in ("condom", "iptu", "taxa")):  # ignora condomínio/IPTU
+            continue
+        v = int(m.group(1).replace(".", ""))
+        if v >= 300:
+            out.append(v)
+    return out
+
+
 def first_price(text):
-    vals = [int(m.replace(".", "")) for m in PRICE_RE.findall(text or "")]
-    vals = [v for v in vals if v >= 300]
-    return vals[0] if vals else None
+    pr = prices(text)
+    return pr[0] if pr else None
+
+
+def ok_price(v, fin):
+    """Descarta valores implausíveis (ex.: preço de venda numa busca de aluguel)."""
+    if not v:
+        return None
+    if fin == "alugar":
+        return v if 300 <= v <= 80_000 else None
+    return v if v >= 40_000 else None
+
+
+def is_listing_url(url):
+    u = urlparse(url)
+    host, path = u.netloc.replace("www.", ""), u.path
+    for dom, pat in LISTING_RE.items():
+        if dom in host:
+            return bool(re.search(pat, path))
+    return bool(re.search(r"/(imovel|imoveis|propriedades?|anuncio|ad)/.*\d{4,}|-\d{6,}(?:[/?#]|$)", path))
+
+
+def reject_reason(c, p):
+    if c.get("dead"):
+        return "anúncio fora do ar (404/410)"
+    a, pr = c.get("area"), c.get("preco")
+    min_area = int(p["area_m2"]) - AREA_TOL_DOWN
+    if a and a < min_area:
+        return f"área {a} m² abaixo do mínimo ({min_area} m²)"
+    if pr and pr > p["valor_max"] * (1 + PRICE_TOL):
+        return f"preço {brl(pr)} acima do limite"
+    return ""
 
 
 def first_area(text):
@@ -254,7 +329,7 @@ def site_name(url):
     return host
 
 
-def ddg(query, n=6):
+def ddg(query, n=8):
     try:
         from ddgs import DDGS
     except ImportError:
@@ -277,20 +352,48 @@ def ddg(query, n=6):
     return []
 
 
+JSON_PRICE = [re.compile(x, re.I) for x in (
+    r'"(?:rentPrice|salePrice|price|totalCost|rent|listingPrice)"\s*:\s*"?(\d{3,9})',
+    r'product:price:amount"[^>]*content="(\d[\d.]*)"', r'itemprop="price"[^>]*content="(\d[\d.]*)"')]
+JSON_AREA = [re.compile(x, re.I) for x in (
+    r'"(?:usableAreas?|area|totalArea|livingArea|useableArea)"\s*:\s*\[?\s*"?(\d{2,4})',
+    r'itemprop="floorSize"[^>]*content="(\d{2,4})')]
+
+
 def fetch_meta(url):
-    r = requests.get(url, headers=UA, timeout=6)
-    html = r.text[:400_000]
+    r = requests.get(url, headers=UA, timeout=8)
+    out = {"status": r.status_code, "title": "", "desc": "", "preco": None, "area": None, "origem": ""}
+    if r.status_code >= 400:
+        return out
+    html = r.text[:700_000]
     title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
     desc = re.search(r'<meta[^>]+(?:og:description|name="description")[^>]+content="([^"]+)"', html, re.I)
+    out["title"] = (title.group(1).strip() if title else "")[:160]
+    out["desc"] = (desc.group(1).strip() if desc else "")[:300]
+    head = f"{out['title']} {out['desc']}"
     body = re.sub(r"<script.*?</script>|<style.*?</style>|<[^>]+>", " ", html, flags=re.S | re.I)
     body = re.sub(r"\s+", " ", body)[:3000]
-    return {
-        "status": r.status_code,
-        "title": (title.group(1).strip() if title else "")[:160],
-        "desc": (desc.group(1).strip() if desc else "")[:300],
-        "preco": first_price(body),
-        "area": first_area(body),
-    }
+    # ordem de confiança: título/descrição -> JSON embutido -> corpo da página
+    pr = first_price(head)
+    out["origem"] = "título/descrição" if pr else ""
+    if not pr:
+        for rx in JSON_PRICE:
+            m = rx.search(html)
+            if m:
+                pr, out["origem"] = int(float(m.group(1))), "JSON da página"
+                break
+    if not pr:
+        pr = first_price(body)
+        out["origem"] = "corpo da página" if pr else ""
+    ar = first_area(head)
+    if not ar:
+        for rx in JSON_AREA:
+            m = rx.search(html)
+            if m:
+                ar = int(m.group(1))
+                break
+    out["preco"], out["area"] = pr, ar or first_area(body)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -311,12 +414,14 @@ def n_extract(s):
     try:
         data = parse_json(llm(s, "extract", system, user, max_tokens=1500, as_json=True))
     except Exception as e:
-        s["errors"].append(f"[extract] fallback regex ({e})")
+        s["errors"].append(f"[extract] fallback regex ({e}){hint(e)}")
         data = {"intent": "busca", "valor_max": first_price(msg), "area_m2": first_area(msg)}
     for k in ["bairro", "cidade", "valor_max", "finalidade", "area_m2", "quartos", "vagas", "extras"]:
         v = data.get(k)
         if v not in (None, "", 0):
             prof[k] = v
+    if data.get("finalidade"):
+        prof["_finalidade_inferida"] = False
     prof.setdefault("cidade", s["cidade_default"])
     s["intent"] = data.get("intent", "busca")
     if s["intent"] == "conversa" and not s["top3"] and not any(prof.get(k) for k in ("bairro", "valor_max")):
@@ -351,20 +456,21 @@ def n_answer(s):
 
 def n_queries(s):
     p, mode = s["profile"], s["attempt"]
+    if "_finalidade_inferida" not in p:
+        p["_finalidade_inferida"] = not p.get("finalidade")
     fin = p.get("finalidade") or ("alugar" if p["valor_max"] <= 20000 else "comprar")
-    p["_finalidade_inferida"] = not s["profile"].get("finalidade")
     p["finalidade"] = fin
     base = f"{fin} apartamento {p['bairro']} {p['cidade']}"
-    extras = f" {p['quartos']} quartos" if p.get("quartos") else ""
+    extras = f" {int(p['quartos'])} quartos" if p.get("quartos") else ""
     qs = []
+    for name in s["sites"]:
+        dom = SITES[name]
+        site = f"site:{dom}{SITE_PATH.get(dom, '')}"  # foca em páginas de imóvel específico
+        qs.append((name, f"{site} {base} {int(p['area_m2'])} m²{extras}" if mode == 0 else f"{site} {base}"))
     if mode == 0:
-        for name in s["sites"]:
-            qs.append((name, f"site:{SITES[name]} {base} {int(p['area_m2'])} m²{extras}"))
         qs.append(("Web", f"{base} {int(p['area_m2'])} m² até R$ {int(p['valor_max'])}{extras}"))
-    else:  # busca relaxada: sem tamanho, sem restrição de quartos
-        for name in s["sites"]:
-            qs.append((name, f"site:{SITES[name]} {base}"))
-        qs.append(("Web", f"imóveis {fin} {p['bairro']} {p['cidade']} até R$ {int(p['valor_max'])}"))
+    else:
+        qs.append(("Web", f"imóvel {fin} {p['bairro']} {p['cidade']} até R$ {int(p['valor_max'])}"))
     s["queries"] = qs
     s["attempt"] += 1
     return f"{len(qs)} queries (modo {'relaxado' if mode else 'estrito'})"
@@ -408,17 +514,19 @@ def n_native(s):
     p = s["profile"]
     domains = [SITES[n] for n in s["sites"]]
     crit = {k: v for k, v in p.items() if not k.startswith("_")}
+    min_area = int(p["area_m2"]) - AREA_TOL_DOWN
     system = ("Você é um assistente de busca imobiliária no Brasil. Use a ferramenta de busca web para achar anúncios "
-              "REAIS e específicos (página de um imóvel) nos sites indicados. Nunca invente URLs ou dados. "
-              "Responda SOMENTE com JSON, sem texto extra.")
-    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nSites: {', '.join(domains)}\n\n"
-            'Retorne até 8 anúncios no formato: {"anuncios":[{"url":str,"titulo":str,"preco":number|null,'
-            '"area_m2":number|null,"trecho":"resumo curto do anúncio"}]}. Use null quando não souber.')
+              "REAIS nos sites indicados. Cada item deve ser a URL da página de UM imóvel específico (nunca página de "
+              "busca, listagem, bairro ou home). Nunca invente URLs ou dados. Responda SOMENTE com JSON, sem texto extra.")
+    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nÁrea mínima: {min_area} m². "
+            f"Valor máximo: R$ {int(p['valor_max'])}.\nSites: {', '.join(domains)}\n\n"
+            'Retorne até 8 anúncios: {"anuncios":[{"url":str,"titulo":str,"preco":number|null,'
+            '"area_m2":number|null,"trecho":"resumo curto"}]}. Use null quando não souber.')
     data = parse_json(llm_web(s, "native", system, user, domains))
     n = 0
     for a in data.get("anuncios", [])[:10]:
         url = str(a.get("url", ""))
-        if not url.startswith("http") or url in s["raw"]:
+        if not url.startswith("http") or url in s["raw"] or not is_listing_url(url):
             continue
         s["raw"][url] = {"url": url, "fonte": site_name(url), "titulo": str(a.get("titulo", ""))[:160],
                          "trecho": str(a.get("trecho") or "")[:350], "preco": num(a.get("preco")),
@@ -430,33 +538,33 @@ def n_native(s):
 def n_rank(s):
     p = s["profile"]
     bairro = p["bairro"].lower()
-    cands = []
+    s["dropped"], cands = [], []
     for c in s["raw"].values():
+        if not is_listing_url(c["url"]):
+            s["dropped"].append({"url": c["url"], "motivo": "página de busca/listagem, não é um anúncio específico"})
+            continue
         text = f"{c['titulo']} {c['trecho']}"
-        c["preco"] = first_price(text) or c.get("preco")
+        c["preco"] = ok_price(first_price(text) or c.get("preco"), p["finalidade"])
         c["area"] = first_area(text) or c.get("area")
-        score = 0
-        score += 2 if "/imovel/" in c["url"] or "/imoveis/" in c["url"] else 0
-        score += 2 if bairro in (text + c["url"]).lower() else 0
-        score += 1 if c["preco"] else 0
-        score += 1 if c["area"] else 0
-        if c["preco"] and c["preco"] > p["valor_max"] * 1.15:
-            score -= 5
-        if c["area"] and c["area"] < p["area_m2"] * 0.8:
-            score -= 3
-        c["score"] = score
+        why = reject_reason(c, p)
+        if why:
+            s["dropped"].append({"url": c["url"], "motivo": why})
+            continue
+        c["score"] = (2 * (bairro in (text + c["url"]).lower()) + 2 * bool(c["preco"]) + 2 * bool(c["area"])
+                      + (1 if c["area"] and c["area"] >= p["area_m2"] else 0))
         cands.append(c)
     cands.sort(key=lambda c: c["score"], reverse=True)
-    s["cands"] = [c for c in cands if c["score"] > -3][:8]
-    return f"{len(s['cands'])} candidatos (de {len(cands)})"
+    s["cands"] = cands[:10]
+    return f"{len(s['cands'])} candidatos ({len(s['dropped'])} descartados de {len(s['raw'])})"
 
 
 def n_enrich(s):
+    p = s["profile"]
     todo = [c for c in s["cands"] if not (c.get("preco") and c.get("area")) and "meta" not in c]
 
     def one(c):
         try:
-            meta, _ = cached("meta:" + c["url"], lambda: fetch_meta(c["url"]))
+            meta, _ = cached("meta2:" + c["url"], lambda: fetch_meta(c["url"]))
             return c, meta
         except Exception as e:
             return c, {"erro": str(e)[:80]}
@@ -464,62 +572,92 @@ def n_enrich(s):
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         for c, meta in ex.map(one, todo):
             c["meta"] = meta
-            c["preco"] = c.get("preco") or meta.get("preco")
+            if meta.get("status") in (404, 410):
+                c["dead"] = True
+            c["preco"] = c.get("preco") or ok_price(meta.get("preco"), p["finalidade"])
             c["area"] = c.get("area") or meta.get("area")
             c["trecho"] = (c["trecho"] + " " + meta.get("desc", ""))[:500]
-    ok = sum(1 for c in todo if "erro" not in c["meta"])
-    return f"{ok}/{len(todo)} páginas lidas"
+    keep = []
+    for c in s["cands"]:  # reaplica os filtros com os dados novos (área/preço lidos da página)
+        why = reject_reason(c, p)
+        if why:
+            s["dropped"].append({"url": c["url"], "motivo": why})
+        else:
+            keep.append(c)
+    s["cands"] = keep
+    ok = sum(1 for c in todo if "erro" not in c["meta"] and c["meta"].get("status", 0) < 400)
+    return f"{ok}/{len(todo)} páginas lidas; {len(keep)} candidatos após filtros"
 
 
 def n_select(s):
     p = s["profile"]
-    if not s["cands"]:
+    pool = s["cands"]
+    if not pool:
         s["top3"] = []
-        return "sem candidatos"
+        return "sem candidatos após os filtros"
+    min_area = int(p["area_m2"]) - AREA_TOL_DOWN
     compact = [{"id": i, "fonte": c["fonte"], "titulo": c["titulo"][:120], "trecho": c["trecho"][:350],
-                "preco_detectado": c.get("preco"), "area_detectada": c.get("area")}
-               for i, c in enumerate(s["cands"])]
+                "preco_detectado": c.get("preco"), "area_detectada": c.get("area")} for i, c in enumerate(pool)]
     crit = {k: v for k, v in p.items() if not k.startswith("_")}
     system = ("Você é um corretor especialista. Escolha até 3 anúncios que melhor atendem aos critérios, SOMENTE entre "
               "os candidatos fornecidos. Nunca invente dados: use null quando não souber. Responda só JSON.")
-    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nCandidatos: {json.dumps(compact, ensure_ascii=False)}\n\n"
+    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\n"
+            f"REGRAS: área mínima {min_area} m² (nunca escolha área menor); valor máximo R$ {int(p['valor_max'])}; "
+            "prefira anúncios com preço e área confirmados; se não aparecerem nos dados, use null.\n"
+            f"Candidatos: {json.dumps(compact, ensure_ascii=False)}\n\n"
             'Formato: {"opcoes":[{"id":int,"titulo":str,"preco":number|null,"area_m2":number|null,"quartos":number|null,'
-            '"aderencia":0-100,"motivo":"1-2 frases","alertas":["itens a confirmar/divergências"]}]} '
-            "ordenado por aderência. Ignore páginas de listagem genérica sem imóvel específico, a menos que não haja melhor.")
+            '"aderencia":0-100,"motivo":"1-2 frases","alertas":["divergências com o pedido"]}]} ordenado por aderência.')
     data = parse_json(llm(s, "select", system, user, max_tokens=4000, as_json=True))
     out = []
     for o in data.get("opcoes", [])[:3]:
         i = o.get("id")
-        if isinstance(i, int) and 0 <= i < len(s["cands"]):  # link vem do candidato real, nunca do LLM
-            c = s["cands"][i]
-            out.append({**o, "url": c["url"], "fonte": c["fonte"]})
+        if not (isinstance(i, int) and 0 <= i < len(pool)):
+            continue
+        c = pool[i]  # link e valores detectados vêm do anúncio real, nunca do LLM
+        area = c.get("area") or num(o.get("area_m2"))
+        preco = c.get("preco") or ok_price(num(o.get("preco")), p["finalidade"])
+        if area and area < min_area:
+            continue
+        out.append({**o, "preco": preco, "area_m2": area, "url": c["url"], "fonte": c["fonte"]})
     s["top3"] = out
     return f"{len(out)} opções escolhidas"
 
 
 def r_after_select(s):
-    return "queries" if len(s["top3"]) < 3 and s["attempt"] < 2 else "compose"
+    if len(s["top3"]) >= 3:
+        return "compose"
+    if s["attempt"] < 2:
+        return "queries"  # 1ª tentativa insuficiente -> busca relaxada
+    if s["native_fb"] and not s["native_used"]:
+        return "native"  # ainda faltam opções -> busca nativa da IA (1x)
+    return "compose"
 
 
 def n_compose(s):
     p, n = s["profile"], len(s["top3"])
+    min_area = int(p["area_m2"]) - AREA_TOL_DOWN
     if n == 0:
-        s["reply"] = ("Não encontrei anúncios aderentes agora. Tente ampliar o valor, o tamanho ou o bairro "
-                      "(ou ative o modo debug para ver o que as buscas retornaram).")
+        s["reply"] = (f"Não encontrei anúncios específicos com **mínimo de {min_area} m²** e valor até "
+                      f"{brl(p['valor_max'])}. Tente ampliar o valor ou o bairro "
+                      "(a aba **Debug** mostra o que foi descartado e por quê).")
         return "nenhuma opção"
-    s["reply"] = (f"Encontrei **{n} opç{'ão' if n == 1 else 'ões'}** em **{p['bairro']}/{p['cidade']}** "
-                  f"para **{p['finalidade']}**, até {brl(p['valor_max'])} e ~{int(p['area_m2'])} m². "
-                  "Veja os detalhes e links ao lado →")
+    s["reply"] = (f"Encontrei **{n} opç{'ão' if n == 1 else 'ões'}** em **{p['bairro']}/{p['cidade']}** para "
+                  f"**{p['finalidade']}**, até {brl(p['valor_max'])} e **no mínimo {min_area} m²** "
+                  f"(pedido: {int(p['area_m2'])} m², tolerância de {AREA_TOL_DOWN} m² abaixo). Detalhes ao lado →")
+    sem_preco = sum(1 for o in s["top3"] if not o.get("preco"))
+    if sem_preco:
+        s["reply"] += (f"\n\n💲 **{sem_preco} de {n} sem valor identificado** — muitos portais carregam o preço via "
+                       "JavaScript e não consegui lê-lo. Confirme no link do anúncio.")
     if p.get("_finalidade_inferida"):
-        s["reply"] += f"\n\n_Assumi que você quer **{p['finalidade']}** pelo valor informado; me diga se for o contrário._"
+        s["reply"] += f"\n\n_Assumi **{p['finalidade']}** pelo valor informado; me diga se for o contrário._"
     if n < 3:
-        s["reply"] += "\n\n_Só achei menos de 3 opções confiáveis, mesmo após ampliar a busca._"
-    s["reply"] += "\n\n⚠️ Preços e disponibilidade vêm de busca pública: confirme no anúncio."
-    return f"{n} opções"
+        s["reply"] += "\n\n_Só achei menos de 3 opções confiáveis, mesmo ampliando a busca._"
+    s["reply"] += "\n\n⚠️ Dados vêm de busca pública: confirme preço e disponibilidade no anúncio."
+    return f"{n} opções, {sem_preco} sem preço"
 
 
 def n_fail(s):
-    s["reply"] = "Tive um problema ao processar seu pedido. Ative o **modo debug** na barra lateral para ver o erro."
+    s["reply"] = "Tive um problema ao processar seu pedido. Abra a aba **Debug** para ver o erro."
     return "falha"
 
 
@@ -546,40 +684,60 @@ LABELS = {"extract": "Entendendo o pedido", "queries": "Montando buscas", "searc
 # ----------------------------------------------------------------------------
 # Interface
 # ----------------------------------------------------------------------------
+H = 560  # altura fixa e igual para conversa e painel direito (ambos com scroll próprio)
 ss = st.session_state
 ss.setdefault("messages", [])
 ss.setdefault("profile", {})
 ss.setdefault("top3", [])
 ss.setdefault("last_state", None)
 
+
+def test_key(provider):
+    try:
+        if provider == "OpenAI":
+            from openai import OpenAI
+
+            OpenAI(api_key=secret("OPENAI_API_KEY")).models.list()
+        else:
+            import anthropic
+
+            anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY")).models.list(limit=1)
+        return "✅ chave válida"
+    except Exception as e:
+        return f"❌ {type(e).__name__}: {str(e)[:200]}{hint(e)}"
+
+
 with st.sidebar:
     st.header("⚙️ Configurações")
     provider = st.radio("Provedor de IA", ["OpenAI", "Claude"], horizontal=True)
     model = st.text_input("Modelo", DEFAULT_MODELS[provider], key=f"model_{provider}",
-                          help="Use um modelo rápido/barato; o grafo faz só 2 chamadas por busca.")
+                          help="Use um modelo rápido/barato; o grafo faz poucas chamadas por busca.")
     cidade = st.text_input("Cidade padrão", "São Paulo")
     sites = st.multiselect("Sites", list(SITES), default=list(SITES)[:5])
     native_fb = st.toggle("Fallback: busca nativa da IA", value=True,
-                          help="Só é usada se o DuckDuckGo falhar. ~US$ 0,01 por busca + tokens.")
-    debug = st.toggle("🐞 Modo debug", value=False)
+                          help="Usada se o DuckDuckGo falhar ou faltarem opções. ~US$ 0,01 por busca + tokens.")
     if st.button("🗑️ Nova conversa", use_container_width=True):
         for k in ("messages", "profile", "top3", "last_state"):
             ss.pop(k, None)
         st.rerun()
-    if debug and st.button("Limpar cache de buscas", use_container_width=True):
-        CACHE.clear()
-        st.toast("Cache limpo")
-    if debug:
-        st.caption("Chaves nos secrets")
-        st.write("OpenAI:", "✅" if secret("OPENAI_API_KEY") else "❌", " Claude:",
-                 "✅" if secret("ANTHROPIC_API_KEY") else "❌")
+    with st.expander("🔑 Diagnóstico das chaves"):
+        for label, name, prov in (("OpenAI", "OPENAI_API_KEY", "OpenAI"), ("Claude", "ANTHROPIC_API_KEY", "Claude")):
+            v, src = secret_info(name)
+            st.write(f"**{label}:** " + (f"`{v[:7]}…{v[-4:]}` · {len(v)} caracteres · fonte: {src}" if v
+                                         else "❌ não encontrada"))
+        if st.button("Testar chaves", use_container_width=True):
+            st.write("OpenAI:", test_key("OpenAI"))
+            st.write("Claude:", test_key("Claude"))
+        if st.button("Limpar cache de buscas", use_container_width=True):
+            CACHE.clear()
+            st.toast("Cache limpo")
 
 st.title("🏠 Agente Imobiliário")
-left, right = st.columns([1, 1], gap="large")
+left, right = st.columns(2, gap="large")
 
 with left:
-    st.subheader("💬 Conversa")
-    box = st.container(height=520)
+    with st.tabs(["💬 Conversa"])[0]:
+        box = st.container(height=H)
     prompt = st.chat_input("Ex.: apartamento em Pinheiros, até R$ 4.500, 60 m², aceita pet")
 
 with box:
@@ -598,10 +756,10 @@ with box:
                 "provider": provider, "model": model.strip() or DEFAULT_MODELS[provider],
                 "cidade_default": cidade, "sites": sites or list(SITES)[:3], "attempt": 0,
                 "native_fb": native_fb, "native_used": False,
-                "raw": {}, "cands": [], "queries": [], "search_log": [], "llm_log": [], "trace": [], "errors": [],
-                "reply": "", "intent": "", "missing": [],
+                "raw": {}, "dropped": [], "cands": [], "queries": [], "search_log": [], "llm_log": [],
+                "trace": [], "errors": [], "reply": "", "intent": "", "missing": [],
             }
-            with st.status("Trabalhando...", expanded=debug) as status:
+            with st.status("Trabalhando...", expanded=False) as status:
                 build_graph().run(state, on_step=lambda n: status.update(label=LABELS.get(n, n) + "..."))
                 status.update(label="Pronto", state="error" if state["errors"] else "complete", expanded=False)
             st.markdown(state["reply"])
@@ -612,46 +770,57 @@ with box:
         ss.last_state = state
 
 with right:
-    st.subheader("🏘️ Melhores opções")
-    if not ss.top3:
-        st.caption("As 3 melhores opções aparecerão aqui.")
-    for i, o in enumerate(ss.top3, 1):
-        with st.container(border=True):
-            st.markdown(f"**{i}. {o.get('titulo', 'Imóvel')}**  \n`{o['fonte']}`")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Preço", brl(o.get("preco")))
-            c2.metric("Área", f"{o['area_m2']} m²" if o.get("area_m2") else "—")
-            c3.metric("Quartos", o.get("quartos") or "—")
-            score = int(o.get("aderencia") or 0)
-            st.progress(min(max(score, 0), 100) / 100, text=f"Aderência: {score}%")
-            st.write(o.get("motivo", ""))
-            for a in o.get("alertas") or []:
-                st.caption(f"⚠️ {a}")
-            st.link_button("Ver anúncio ↗", o["url"], use_container_width=True)
+    tab_res, tab_dbg = st.tabs(["🏘️ Resultado", "🐞 Debug"])
 
-    if debug and ss.last_state:
-        s = ss.last_state
-        st.divider()
-        st.subheader("🐞 Debug")
-        if s["errors"]:
-            for e in s["errors"]:
-                st.error(e)
-        tabs = st.tabs(["Grafo", "LLM", "Buscas", "Candidatos", "Estado"])
-        with tabs[0]:
-            st.dataframe(s["trace"], use_container_width=True)
-            st.caption(f"Tempo total: {sum(t['ms'] for t in s['trace'])} ms")
-        with tabs[1]:
-            ws = sum(x.get("web_searches", 0) for x in s["llm_log"])
-            st.caption(f"Tokens: in={sum(x['tokens_in'] for x in s['llm_log'])} "
-                       f"out={sum(x['tokens_out'] for x in s['llm_log'])} · "
-                       f"buscas nativas: {ws} (~US$ {ws * 0.01:.2f} em taxa de busca)")
-            for x in s["llm_log"]:
-                with st.expander(f"{x['nó']} · {x['modelo']} · {x['ms']} ms"):
-                    st.json(x)
-        with tabs[2]:
-            st.dataframe(s["search_log"], use_container_width=True)
-        with tabs[3]:
-            st.json([{k: v for k, v in c.items() if k != "trecho"} for c in s["cands"]], expanded=False)
-        with tabs[4]:
-            st.json({"perfil": s["profile"], "intent": s["intent"], "faltando": s["missing"],
-                     "tentativas": s["attempt"]}, expanded=False)
+    with tab_res:
+        with st.container(height=H):
+            if not ss.top3:
+                st.caption("As 3 melhores opções aparecerão aqui.")
+            for i, o in enumerate(ss.top3, 1):
+                with st.container(border=True):
+                    st.markdown(f"**{i}. {o.get('titulo', 'Imóvel')}**  \n`{o['fonte']}`")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Preço", brl(o["preco"]) if o.get("preco") else "Não informado")
+                    c2.metric("Área", f"{o['area_m2']} m²" if o.get("area_m2") else "Não confirmada")
+                    c3.metric("Quartos", o.get("quartos") or "—")
+                    if not o.get("preco"):
+                        st.warning("Valor não identificado no anúncio — confirme no link.", icon="💲")
+                    if not o.get("area_m2"):
+                        st.caption("⚠️ Área não confirmada — confira no anúncio.")
+                    score = int(o.get("aderencia") or 0)
+                    st.progress(min(max(score, 0), 100) / 100, text=f"Aderência: {score}%")
+                    st.write(o.get("motivo", ""))
+                    for a in o.get("alertas") or []:
+                        st.caption(f"⚠️ {a}")
+                    st.link_button("Abrir anúncio ↗", o["url"], use_container_width=True)
+
+    with tab_dbg:
+        with st.container(height=H):
+            s = ss.last_state
+            if not s:
+                st.caption("Faça uma busca para ver o debug.")
+            else:
+                for e in s["errors"]:
+                    st.error(e)
+                t = st.tabs(["Grafo", "LLM", "Buscas", "Candidatos", "Descartados", "Estado"])
+                with t[0]:
+                    st.dataframe(s["trace"], use_container_width=True)
+                    st.caption(f"Tempo total: {sum(x['ms'] for x in s['trace'])} ms")
+                with t[1]:
+                    ws = sum(x.get("web_searches", 0) for x in s["llm_log"])
+                    st.caption(f"Tokens: in={sum(x['tokens_in'] for x in s['llm_log'])} "
+                               f"out={sum(x['tokens_out'] for x in s['llm_log'])} · "
+                               f"buscas nativas: {ws} (~US$ {ws * 0.01:.2f} em taxa de busca)")
+                    for x in s["llm_log"]:
+                        with st.expander(f"{x['nó']} · {x['modelo']} · {x['ms']} ms"):
+                            st.json(x)
+                with t[2]:
+                    st.dataframe(s["search_log"], use_container_width=True)
+                with t[3]:
+                    st.json([{k: v for k, v in c.items() if k != "trecho"} for c in s["cands"]], expanded=False)
+                with t[4]:
+                    st.caption("Links descartados e o motivo (listagem, área abaixo do mínimo, preço, fora do ar).")
+                    st.dataframe(s["dropped"], use_container_width=True)
+                with t[5]:
+                    st.json({"perfil": s["profile"], "intent": s["intent"], "faltando": s["missing"],
+                             "tentativas": s["attempt"], "native_usada": s["native_used"]}, expanded=False)
