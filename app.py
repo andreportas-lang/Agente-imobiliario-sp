@@ -126,7 +126,6 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
         r = OpenAI(api_key=key).chat.completions.create(
             model=model,
             max_completion_tokens=max_tokens,
-            temperature=0,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             **kw,
         )
@@ -141,7 +140,6 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
         r = anthropic.Anthropic(api_key=key).messages.create(
             model=model,
             max_tokens=max_tokens,
-            temperature=0,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
