@@ -1,6 +1,7 @@
 import re
 import json
 import streamlit as st
+import traceback
 
 from typing import TypedDict, List, Dict
 
@@ -235,6 +236,7 @@ def node_extrator(state: AgentState):
     except Exception as e:
 
         state["erro_extracao"] = str(e)
+        state["debug"] = trac
 
     return state
 
