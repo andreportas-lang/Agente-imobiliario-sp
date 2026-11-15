@@ -236,7 +236,7 @@ def node_extrator(state: AgentState):
     except Exception as e:
 
         state["erro_extracao"] = str(e)
-        state["debug"] = trac
+        state["debug"] = traceback.format_exc()
 
     return state
 
