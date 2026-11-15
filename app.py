@@ -16,6 +16,8 @@ Secrets esperados (Streamlit Community Cloud > Settings > Secrets):
 """
 import concurrent.futures as cf
 import hashlib
+import html as htmllib
+import unicodedata
 import json
 import os
 import re
@@ -303,7 +305,19 @@ def is_listing_url(url):
     return bool(re.search(r"/(imovel|imoveis|propriedades?|anuncio|ad)/.*\d{4,}|-\d{6,}(?:[/?#]|$)", path))
 
 
-def reject_reason(c, p):
+def norm(t):
+    t = unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+
+
+def city_confirmed(c, p):
+    """A cidade pedida precisa aparecer na URL, no título ou na descrição (não no corpo/rodapé da página)."""
+    meta = c.get("meta") or {}
+    hay = "-" + norm(f"{c['url']} {c['titulo']} {c['trecho']} {meta.get('title', '')} {meta.get('desc', '')}") + "-"
+    return f"-{norm(p['cidade'])}-" in hay
+
+
+def reject_reason(c, p, final=False):
     if c.get("dead"):
         return "anúncio fora do ar (404/410)"
     a, pr = c.get("area"), c.get("preco")
@@ -312,7 +326,92 @@ def reject_reason(c, p):
         return f"área {a} m² abaixo do mínimo ({min_area} m²)"
     if pr and pr > p["valor_max"] * (1 + PRICE_TOL):
         return f"preço {brl(pr)} acima do limite"
+    if final and not city_confirmed(c, p):
+        return f"cidade não confirmada (esperado: {p['cidade']})"
     return ""
+
+
+def money_html(v, fin):
+    """Valor abreviado e sem corte: R$ 1,1MM / R$ 850 mil / R$ 4.500."""
+    if not v:
+        return '<span class="muted">Não informado</span>'
+    exato = brl(v)
+    if v >= 1_000_000:
+        n = f"{v / 1e6:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+        body = f"R$&nbsp;{n}<small>MM</small>"
+    elif v >= 10_000:
+        n = f"{v / 1e3:.1f}".rstrip("0").rstrip(".").replace(".", ",")
+        body = f"R$&nbsp;{n}<small>mil</small>"
+    else:
+        body = f"R$&nbsp;{v:,.0f}".replace(",", ".")
+    return f'<span title="{exato}">{body}</span>'
+
+
+def card_html(i, o, fin):
+    e = lambda x: htmllib.escape(str(x), quote=True)
+    area = o.get("area_m2")
+    score = min(max(int(o.get("aderencia") or 0), 0), 100)
+    quartos = o.get("quartos")
+    parts = [
+        '<div class="card"><div class="card-top">',
+        f'<div class="rank">{i}</div><h4>{e(o.get("titulo") or "Imóvel")}</h4>',
+        f'<span class="pill">{e(o["fonte"])}</span></div>',
+        '<div class="stats">',
+        f'<div class="stat"><div class="lbl">{"Aluguel" if fin == "alugar" else "Valor"}</div>'
+        f'<div class="val">{money_html(o.get("preco"), fin)}</div></div>',
+        '<div class="stat"><div class="lbl">Área</div><div class="val">'
+        + (f"{area}<small>m²</small>" if area else '<span class="muted">Não confirmada</span>') + "</div></div>",
+        '<div class="stat"><div class="lbl">Quartos</div><div class="val">'
+        + (f"{int(quartos)}" if quartos else '<span class="muted">—</span>') + "</div></div>",
+        "</div>",
+        f'<div class="score">Aderência ao pedido · <b>{score}%</b></div><div class="bar"><i style="width:{score}%"></i></div>',
+        f'<div class="why">{e(o.get("motivo", ""))}</div>',
+    ]
+    if not o.get("preco"):
+        parts.append('<div class="warn">💲 Valor não identificado no anúncio — confirme no link.</div>')
+    for a in o.get("alertas") or []:
+        parts.append(f'<div class="alert">⚠️ {e(a)}</div>')
+    parts.append(f'<a class="cta" href="{e(o["url"])}" target="_blank" rel="noopener">Abrir anúncio ↗</a></div>')
+    return "".join(parts)
+
+
+CSS = """<style>
+:root{--acc:#6366f1;--acc2:#0ea5e9;--line:rgba(128,128,128,.25);--soft:rgba(128,128,128,.07)}
+.block-container{padding-top:2.2rem;max-width:1400px}
+.hero{display:flex;align-items:center;gap:.9rem;margin:0 0 .8rem 0}
+.hero .logo{font-size:1.6rem;width:3rem;height:3rem;display:grid;place-items:center;border-radius:14px;
+ background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 6px 18px rgba(99,102,241,.35)}
+.hero h1{font-size:1.65rem;margin:0;padding:0;font-weight:700;letter-spacing:-.02em;line-height:1.2}
+.hero p{margin:.1rem 0 0 0;opacity:.65;font-size:.9rem}
+.card{border:1px solid var(--line);border-radius:16px;padding:1rem 1.1rem;margin:.2rem 0 .9rem 0;background:var(--soft);
+ transition:box-shadow .2s,transform .2s}
+.card:hover{box-shadow:0 8px 24px rgba(0,0,0,.14);transform:translateY(-1px)}
+.card-top{display:flex;align-items:center;gap:.6rem}
+.card h4{margin:0;font-size:1rem;line-height:1.3;font-weight:600;padding:0;flex:1;min-width:0}
+.rank{width:1.7rem;height:1.7rem;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:.85rem;
+ color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));flex:none}
+.pill{font-size:.7rem;padding:.15rem .55rem;border-radius:999px;border:1px solid var(--line);opacity:.85;white-space:nowrap;flex:none}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:.5rem;margin:.8rem 0}
+.stat{border:1px solid var(--line);border-radius:12px;padding:.5rem .65rem;background:rgba(128,128,128,.05);min-width:0}
+.stat .lbl{font-size:.66rem;text-transform:uppercase;letter-spacing:.07em;opacity:.6}
+.stat .val{font-size:1.08rem;font-weight:700;line-height:1.35;overflow-wrap:anywhere}
+.val small{font-size:.62em;font-weight:600;opacity:.75;margin-left:.1rem}
+.muted{font-weight:500;opacity:.55;font-size:.82rem}
+.score{font-size:.75rem;opacity:.75}
+.bar{height:6px;border-radius:99px;background:var(--line);overflow:hidden;margin:.25rem 0 .1rem}
+.bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),var(--acc2))}
+.why{font-size:.9rem;margin:.6rem 0 .3rem 0;line-height:1.45}
+.warn{font-size:.82rem;margin:.4rem 0;padding:.45rem .65rem;border-radius:10px;background:rgba(245,158,11,.14);
+ border:1px solid rgba(245,158,11,.4)}
+.alert{font-size:.8rem;opacity:.8;margin:.2rem 0}
+.cta{display:block;text-align:center;margin-top:.8rem;padding:.55rem;border-radius:10px;text-decoration:none!important;
+ font-weight:600;color:#fff!important;background:linear-gradient(135deg,var(--acc),var(--acc2));transition:filter .2s}
+.cta:hover{filter:brightness(1.1)}
+.empty{border:1.5px dashed var(--line);border-radius:16px;padding:2.2rem 1rem;text-align:center;opacity:.7}
+[data-testid="stChatMessage"]{border-radius:14px}
+button[role="tab"]{font-weight:600}
+[data-testid="stSidebar"] h2{font-size:1.1rem}
+</style>"""
 
 
 def first_area(text):
@@ -518,7 +617,7 @@ def n_native(s):
     system = ("Você é um assistente de busca imobiliária no Brasil. Use a ferramenta de busca web para achar anúncios "
               "REAIS nos sites indicados. Cada item deve ser a URL da página de UM imóvel específico (nunca página de "
               "busca, listagem, bairro ou home). Nunca invente URLs ou dados. Responda SOMENTE com JSON, sem texto extra.")
-    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nÁrea mínima: {min_area} m². "
+    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nCidade: {p['cidade']} (somente imóveis nesta cidade). Área mínima: {min_area} m². "
             f"Valor máximo: R$ {int(p['valor_max'])}.\nSites: {', '.join(domains)}\n\n"
             'Retorne até 8 anúncios: {"anuncios":[{"url":str,"titulo":str,"preco":number|null,'
             '"area_m2":number|null,"trecho":"resumo curto"}]}. Use null quando não souber.')
@@ -560,7 +659,7 @@ def n_rank(s):
 
 def n_enrich(s):
     p = s["profile"]
-    todo = [c for c in s["cands"] if not (c.get("preco") and c.get("area")) and "meta" not in c]
+    todo = [c for c in s["cands"] if not (c.get("preco") and c.get("area") and city_confirmed(c, p)) and "meta" not in c]
 
     def one(c):
         try:
@@ -579,7 +678,7 @@ def n_enrich(s):
             c["trecho"] = (c["trecho"] + " " + meta.get("desc", ""))[:500]
     keep = []
     for c in s["cands"]:  # reaplica os filtros com os dados novos (área/preço lidos da página)
-        why = reject_reason(c, p)
+        why = reject_reason(c, p, final=True)
         if why:
             s["dropped"].append({"url": c["url"], "motivo": why})
         else:
@@ -602,7 +701,7 @@ def n_select(s):
     system = ("Você é um corretor especialista. Escolha até 3 anúncios que melhor atendem aos critérios, SOMENTE entre "
               "os candidatos fornecidos. Nunca invente dados: use null quando não souber. Responda só JSON.")
     user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\n"
-            f"REGRAS: área mínima {min_area} m² (nunca escolha área menor); valor máximo R$ {int(p['valor_max'])}; "
+            f"REGRAS: área mínima {min_area} m² (nunca escolha área menor); valor máximo R$ {int(p['valor_max'])}; cidade obrigatória: {p['cidade']}; "
             "prefira anúncios com preço e área confirmados; se não aparecerem nos dados, use null.\n"
             f"Candidatos: {json.dumps(compact, ensure_ascii=False)}\n\n"
             'Formato: {"opcoes":[{"id":int,"titulo":str,"preco":number|null,"area_m2":number|null,"quartos":number|null,'
@@ -732,7 +831,10 @@ with st.sidebar:
             CACHE.clear()
             st.toast("Cache limpo")
 
-st.title("🏠 Agente Imobiliário")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="logo">🏠</div><div><h1>Agente Imobiliário</h1>'
+            '<p>Informe bairro, valor e tamanho — busco as 3 melhores opções nos principais portais.</p></div></div>',
+            unsafe_allow_html=True)
 left, right = st.columns(2, gap="large")
 
 with left:
@@ -775,24 +877,10 @@ with right:
     with tab_res:
         with st.container(height=H):
             if not ss.top3:
-                st.caption("As 3 melhores opções aparecerão aqui.")
+                st.markdown('<div class="empty">As 3 melhores opções aparecerão aqui.</div>', unsafe_allow_html=True)
+            fin = ss.profile.get("finalidade")
             for i, o in enumerate(ss.top3, 1):
-                with st.container(border=True):
-                    st.markdown(f"**{i}. {o.get('titulo', 'Imóvel')}**  \n`{o['fonte']}`")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Preço", brl(o["preco"]) if o.get("preco") else "Não informado")
-                    c2.metric("Área", f"{o['area_m2']} m²" if o.get("area_m2") else "Não confirmada")
-                    c3.metric("Quartos", o.get("quartos") or "—")
-                    if not o.get("preco"):
-                        st.warning("Valor não identificado no anúncio — confirme no link.", icon="💲")
-                    if not o.get("area_m2"):
-                        st.caption("⚠️ Área não confirmada — confira no anúncio.")
-                    score = int(o.get("aderencia") or 0)
-                    st.progress(min(max(score, 0), 100) / 100, text=f"Aderência: {score}%")
-                    st.write(o.get("motivo", ""))
-                    for a in o.get("alertas") or []:
-                        st.caption(f"⚠️ {a}")
-                    st.link_button("Abrir anúncio ↗", o["url"], use_container_width=True)
+                st.markdown(card_html(i, o, fin), unsafe_allow_html=True)
 
     with tab_dbg:
         with st.container(height=H):
