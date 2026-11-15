@@ -160,6 +160,62 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
     return text
 
 
+def llm_web(state, node, system, user, domains, max_tokens=4000):
+    """Chamada com busca web NATIVA do provedor (usada só como fallback do DuckDuckGo)."""
+    provider, model = state["provider"], state["model"]
+    t0 = time.perf_counter()
+    if provider == "OpenAI":
+        key = secret("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY não encontrada nos secrets.")
+        from openai import OpenAI
+
+        client = OpenAI(api_key=key)
+        kw = dict(model=model, instructions=system, input=user, max_output_tokens=max_tokens)
+        try:
+            r = client.responses.create(tools=[{"type": "web_search"}], **kw)
+        except Exception:  # modelos antigos só aceitam a versão preview da ferramenta
+            r = client.responses.create(tools=[{"type": "web_search_preview"}], **kw)
+        text = r.output_text or ""
+        nsearch = sum(1 for o in r.output if getattr(o, "type", "") == "web_search_call")
+        stop = str(r.status)
+        tin, tout = r.usage.input_tokens, r.usage.output_tokens
+    else:
+        key = secret("ANTHROPIC_API_KEY")
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY não encontrada nos secrets.")
+        import anthropic
+
+        r = anthropic.Anthropic(api_key=key).messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3,
+                    "allowed_domains": domains}],
+        )
+        text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
+        nsearch = getattr(getattr(r.usage, "server_tool_use", None), "web_search_requests", 0) or 0
+        stop = f"{r.stop_reason} | blocos={[getattr(b, 'type', '?') for b in r.content]}"
+        tin, tout = r.usage.input_tokens, r.usage.output_tokens
+    state["llm_log"].append(
+        {"nó": node, "modelo": f"{provider}:{model}", "tokens_in": tin, "tokens_out": tout,
+         "max_tokens": max_tokens, "web_searches": nsearch, "parada": stop,
+         "ms": round((time.perf_counter() - t0) * 1000), "enviado_system": system, "enviado_user": user,
+         "resposta": text[:1500]}
+    )
+    if not text.strip():
+        raise RuntimeError(f"Busca nativa retornou vazio (parada={stop}; tokens_out={tout}/{max_tokens}).")
+    return text
+
+
+def num(x):
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_json(text):
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
@@ -203,8 +259,22 @@ def ddg(query, n=6):
         from ddgs import DDGS
     except ImportError:
         from duckduckgo_search import DDGS
-    with DDGS() as d:
-        return list(d.text(query, region="br-pt", max_results=n))
+    last = None
+    for backend in ("auto", "bing"):  # se um backend der timeout/bloqueio, tenta o próximo
+        try:
+            with DDGS(timeout=10) as d:
+                try:
+                    res = list(d.text(query, region="br-pt", max_results=n, backend=backend))
+                except TypeError:  # versão antiga da lib, sem parâmetro backend
+                    res = list(d.text(query, region="br-pt", max_results=n))
+            if res:
+                return res
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    if last:
+        raise last
+    return []
 
 
 def fetch_meta(url):
@@ -303,20 +373,58 @@ def n_queries(s):
 def n_search(s):
     def one(item):
         name, q = item
-        res, hit = cached("ddg:" + q, lambda: ddg(q))
-        return name, q, res, hit
+        try:
+            res, hit = cached("ddg:" + q, lambda: ddg(q))
+            if not res:
+                CACHE.pop("ddg:" + q, None)  # não guarda busca vazia no cache
+            return name, q, res, hit, ""
+        except Exception as e:
+            return name, q, [], False, f"{type(e).__name__}: {str(e)[:120]}"
 
-    hits = 0
-    with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        for name, q, res, hit in ex.map(one, s["queries"]):
+    hits, errs = 0, []
+    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+        for name, q, res, hit, err in ex.map(one, s["queries"]):
             hits += hit
-            s["search_log"].append({"query": q, "resultados": len(res), "cache": hit})
+            if err:
+                errs.append(err)
+            s["search_log"].append({"query": q, "resultados": len(res), "cache": hit, "erro": err})
             for r in res:
                 url = r.get("href", "")
                 if url and url not in s["raw"]:
                     s["raw"][url] = {"url": url, "fonte": site_name(url), "titulo": r.get("title", ""),
                                      "trecho": r.get("body", "")}
-    return f"{len(s['raw'])} URLs únicas ({hits} queries do cache)"
+    if errs and not s["raw"] and not (s["native_fb"] and not s["native_used"]):
+        raise RuntimeError(f"Todas as buscas falharam ({len(errs)}). Primeiro erro: {errs[0]}")
+    return f"{len(s['raw'])} URLs únicas ({hits} do cache, {len(errs)} falhas)"
+
+
+def r_after_search(s):
+    # DuckDuckGo não trouxe nada (bloqueio/timeout) -> busca nativa da IA, no máximo 1 vez
+    return "native" if (not s["raw"] and s["native_fb"] and not s["native_used"]) else "rank"
+
+
+def n_native(s):
+    s["native_used"] = True
+    p = s["profile"]
+    domains = [SITES[n] for n in s["sites"]]
+    crit = {k: v for k, v in p.items() if not k.startswith("_")}
+    system = ("Você é um assistente de busca imobiliária no Brasil. Use a ferramenta de busca web para achar anúncios "
+              "REAIS e específicos (página de um imóvel) nos sites indicados. Nunca invente URLs ou dados. "
+              "Responda SOMENTE com JSON, sem texto extra.")
+    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nSites: {', '.join(domains)}\n\n"
+            'Retorne até 8 anúncios no formato: {"anuncios":[{"url":str,"titulo":str,"preco":number|null,'
+            '"area_m2":number|null,"trecho":"resumo curto do anúncio"}]}. Use null quando não souber.')
+    data = parse_json(llm_web(s, "native", system, user, domains))
+    n = 0
+    for a in data.get("anuncios", [])[:10]:
+        url = str(a.get("url", ""))
+        if not url.startswith("http") or url in s["raw"]:
+            continue
+        s["raw"][url] = {"url": url, "fonte": site_name(url), "titulo": str(a.get("titulo", ""))[:160],
+                         "trecho": str(a.get("trecho") or "")[:350], "preco": num(a.get("preco")),
+                         "area": num(a.get("area_m2"))}
+        n += 1
+    return f"{n} anúncios via busca nativa ({s['provider']})"
 
 
 def n_rank(s):
@@ -325,7 +433,8 @@ def n_rank(s):
     cands = []
     for c in s["raw"].values():
         text = f"{c['titulo']} {c['trecho']}"
-        c["preco"], c["area"] = first_price(text), first_area(text)
+        c["preco"] = first_price(text) or c.get("preco")
+        c["area"] = first_area(text) or c.get("area")
         score = 0
         score += 2 if "/imovel/" in c["url"] or "/imoveis/" in c["url"] else 0
         score += 2 if bairro in (text + c["url"]).lower() else 0
@@ -420,7 +529,8 @@ def build_graph():
     g.node("ask", n_ask).edge("ask", "END")
     g.node("answer", n_answer).edge("answer", "END")
     g.node("queries", n_queries).edge("queries", "search")
-    g.node("search", n_search).edge("search", "rank")
+    g.node("search", n_search).edge("search", r_after_search)
+    g.node("native", n_native).edge("native", "rank")
     g.node("rank", n_rank).edge("rank", "enrich")
     g.node("enrich", n_enrich).edge("enrich", "select")
     g.node("select", n_select).edge("select", r_after_select)
@@ -429,7 +539,7 @@ def build_graph():
     return g
 
 
-LABELS = {"extract": "Entendendo o pedido", "queries": "Montando buscas", "search": "Buscando nos sites",
+LABELS = {"extract": "Entendendo o pedido", "queries": "Montando buscas", "search": "Buscando nos sites", "native": "Busca nativa da IA (fallback)",
           "rank": "Filtrando candidatos", "enrich": "Lendo anúncios", "select": "Escolhendo as 3 melhores",
           "answer": "Respondendo", "ask": "Verificando dados", "compose": "Finalizando", "fail": "Tratando erro"}
 
@@ -449,6 +559,8 @@ with st.sidebar:
                           help="Use um modelo rápido/barato; o grafo faz só 2 chamadas por busca.")
     cidade = st.text_input("Cidade padrão", "São Paulo")
     sites = st.multiselect("Sites", list(SITES), default=list(SITES)[:5])
+    native_fb = st.toggle("Fallback: busca nativa da IA", value=True,
+                          help="Só é usada se o DuckDuckGo falhar. ~US$ 0,01 por busca + tokens.")
     debug = st.toggle("🐞 Modo debug", value=False)
     if st.button("🗑️ Nova conversa", use_container_width=True):
         for k in ("messages", "profile", "top3", "last_state"):
@@ -485,6 +597,7 @@ with box:
                 "user_msg": prompt, "history": list(ss.messages), "profile": dict(ss.profile), "top3": ss.top3,
                 "provider": provider, "model": model.strip() or DEFAULT_MODELS[provider],
                 "cidade_default": cidade, "sites": sites or list(SITES)[:3], "attempt": 0,
+                "native_fb": native_fb, "native_used": False,
                 "raw": {}, "cands": [], "queries": [], "search_log": [], "llm_log": [], "trace": [], "errors": [],
                 "reply": "", "intent": "", "missing": [],
             }
@@ -528,8 +641,10 @@ with right:
             st.dataframe(s["trace"], use_container_width=True)
             st.caption(f"Tempo total: {sum(t['ms'] for t in s['trace'])} ms")
         with tabs[1]:
+            ws = sum(x.get("web_searches", 0) for x in s["llm_log"])
             st.caption(f"Tokens: in={sum(x['tokens_in'] for x in s['llm_log'])} "
-                       f"out={sum(x['tokens_out'] for x in s['llm_log'])}")
+                       f"out={sum(x['tokens_out'] for x in s['llm_log'])} · "
+                       f"buscas nativas: {ws} (~US$ {ws * 0.01:.2f} em taxa de busca)")
             for x in s["llm_log"]:
                 with st.expander(f"{x['nó']} · {x['modelo']} · {x['ms']} ms"):
                     st.json(x)
