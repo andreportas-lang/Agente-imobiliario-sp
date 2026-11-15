@@ -18,6 +18,7 @@ import concurrent.futures as cf
 import hashlib
 import html as htmllib
 import unicodedata
+from pathlib import Path
 import json
 import os
 import re
@@ -45,6 +46,16 @@ SITES = {
 DEFAULT_MODELS = {"OpenAI": "gpt-4o-mini", "Claude": "claude-haiku-5-5"}
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 CACHE_TTL = 3600
+# US$ por 1M de tokens (entrada, saída). Confira no site do provedor; dá para ajustar na barra lateral.
+PRICES = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+SEARCH_FEE = 0.01  # US$ por busca web nativa (OpenAI e Anthropic: ~US$ 10 / 1.000 buscas)
+USAGE_FILE = Path(__file__).with_name("usage_log.json")
 AREA_TOL_DOWN = 10   # tolerância máxima (m²) abaixo do tamanho pedido
 PRICE_TOL = 0.10     # tolerância de 10% acima do valor máximo
 # Só aceitamos URLs que apontam para UM imóvel (não páginas de busca/listagem)
@@ -149,6 +160,26 @@ class Graph:
 # ----------------------------------------------------------------------------
 # LLM (OpenAI ou Claude) com contagem de tokens para debug
 # ----------------------------------------------------------------------------
+def call_raw(api, **kw):
+    """Chama api.with_raw_response.create para obter também os headers (limites de uso restantes)."""
+    raw = api.with_raw_response.create(**kw)
+    return raw.parse(), dict(raw.headers)
+
+
+def rl_parse(provider, hdr):
+    h = {k.lower(): v for k, v in (hdr or {}).items()}
+    if provider == "OpenAI":
+        keys = {"requisições restantes": "x-ratelimit-remaining-requests", "limite de requisições": "x-ratelimit-limit-requests",
+                "tokens restantes": "x-ratelimit-remaining-tokens", "limite de tokens": "x-ratelimit-limit-tokens",
+                "renova em": "x-ratelimit-reset-tokens"}
+    else:
+        keys = {"requisições restantes": "anthropic-ratelimit-requests-remaining",
+                "limite de requisições": "anthropic-ratelimit-requests-limit",
+                "tokens restantes": "anthropic-ratelimit-tokens-remaining",
+                "limite de tokens": "anthropic-ratelimit-tokens-limit", "renova em": "anthropic-ratelimit-tokens-reset"}
+    return {k: h[v] for k, v in keys.items() if h.get(v) is not None}
+
+
 def llm(state, node, system, user, max_tokens=600, as_json=False):
     provider, model = state["provider"], state["model"]
     t0 = time.perf_counter()
@@ -159,7 +190,7 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
         from openai import OpenAI
 
         kw = {"response_format": {"type": "json_object"}} if as_json else {}
-        r = OpenAI(api_key=key).chat.completions.create(
+        r, hdr = call_raw(OpenAI(api_key=key).chat.completions,
             model=model,
             max_completion_tokens=max_tokens,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -174,7 +205,7 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
             raise RuntimeError("ANTHROPIC_API_KEY não encontrada nos secrets.")
         import anthropic
 
-        r = anthropic.Anthropic(api_key=key).messages.create(
+        r, hdr = call_raw(anthropic.Anthropic(api_key=key).messages,
             model=model,
             max_tokens=max_tokens,
             system=system,
@@ -183,6 +214,7 @@ def llm(state, node, system, user, max_tokens=600, as_json=False):
         text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
         stop = f"{r.stop_reason} | blocos={[getattr(b, 'type', '?') for b in r.content]}"
         tin, tout = r.usage.input_tokens, r.usage.output_tokens
+    state["ratelimit"] = rl_parse(provider, hdr)
     state["llm_log"].append(
         {"nó": node, "modelo": f"{provider}:{model}", "tokens_in": tin, "tokens_out": tout,
          "max_tokens": max_tokens, "parada": stop, "ms": round((time.perf_counter() - t0) * 1000),
@@ -209,9 +241,9 @@ def llm_web(state, node, system, user, domains, max_tokens=4000):
         client = OpenAI(api_key=key)
         kw = dict(model=model, instructions=system, input=user, max_output_tokens=max_tokens)
         try:
-            r = client.responses.create(tools=[{"type": "web_search"}], **kw)
+            r, hdr = call_raw(client.responses, tools=[{"type": "web_search"}], **kw)
         except Exception:  # modelos antigos só aceitam a versão preview da ferramenta
-            r = client.responses.create(tools=[{"type": "web_search_preview"}], **kw)
+            r, hdr = call_raw(client.responses, tools=[{"type": "web_search_preview"}], **kw)
         text = r.output_text or ""
         nsearch = sum(1 for o in r.output if getattr(o, "type", "") == "web_search_call")
         stop = str(r.status)
@@ -222,7 +254,7 @@ def llm_web(state, node, system, user, domains, max_tokens=4000):
             raise RuntimeError("ANTHROPIC_API_KEY não encontrada nos secrets.")
         import anthropic
 
-        r = anthropic.Anthropic(api_key=key).messages.create(
+        r, hdr = call_raw(anthropic.Anthropic(api_key=key).messages,
             model=model,
             max_tokens=max_tokens,
             system=system,
@@ -234,6 +266,7 @@ def llm_web(state, node, system, user, domains, max_tokens=4000):
         nsearch = getattr(getattr(r.usage, "server_tool_use", None), "web_search_requests", 0) or 0
         stop = f"{r.stop_reason} | blocos={[getattr(b, 'type', '?') for b in r.content]}"
         tin, tout = r.usage.input_tokens, r.usage.output_tokens
+    state["ratelimit"] = rl_parse(provider, hdr)
     state["llm_log"].append(
         {"nó": node, "modelo": f"{provider}:{model}", "tokens_in": tin, "tokens_out": tout,
          "max_tokens": max_tokens, "web_searches": nsearch, "parada": stop,
@@ -373,6 +406,70 @@ def card_html(i, o, fin):
         parts.append(f'<div class="alert">⚠️ {e(a)}</div>')
     parts.append(f'<a class="cta" href="{e(o["url"])}" target="_blank" rel="noopener">Abrir anúncio ↗</a></div>')
     return "".join(parts)
+
+
+def usage_load():
+    d = {"budget": {}, "since": {}, "runs": []}
+    try:
+        d.update(json.loads(USAGE_FILE.read_text()))
+    except Exception:
+        pass
+    return d
+
+
+def usage_save(d):
+    try:
+        d["runs"] = d["runs"][-500:]
+        USAGE_FILE.write_text(json.dumps(d, ensure_ascii=False))
+    except Exception:
+        pass  # filesystem somente leitura: segue sem persistir
+
+
+PHASES = {"extract": "IA · entender pedido", "queries": "Busca web", "search": "Busca web",
+          "native": "Busca nativa (IA)", "rank": "Ranking", "enrich": "Leitura dos anúncios",
+          "select": "IA · escolher as 3", "answer": "IA · responder", "ask": "Resposta", "compose": "Resposta",
+          "fail": "Resposta"}
+
+
+def compute_eff(state, pin, pout):
+    log = state["llm_log"]
+    tin, tout = sum(x["tokens_in"] for x in log), sum(x["tokens_out"] for x in log)
+    searches = sum(x.get("web_searches", 0) for x in log)
+    # OpenAI cobra um bloco fixo de ~8.000 tokens de entrada por busca nos modelos "mini" (estimativa)
+    extra_in = 8000 * searches if state["provider"] == "OpenAI" and "mini" in state["model"].lower() else 0
+    cost_tok = (tin + extra_in) * pin / 1e6 + tout * pout / 1e6
+    cost_search = searches * SEARCH_FEE
+    phases = {}
+    for t in state["trace"]:
+        k = PHASES.get(t["nó"], t["nó"])
+        phases[k] = phases.get(k, 0) + t["ms"]
+    busca = sum(phases.get(k, 0) for k in ("Busca web", "Busca nativa (IA)", "Leitura dos anúncios"))
+    return {"ts": time.time(), "provider": state["provider"], "model": state["model"],
+            "cost_usd": cost_tok + cost_search, "cost_tokens": cost_tok, "cost_search": cost_search,
+            "tin": tin, "tout": tout, "searches": searches, "llm_calls": len([x for x in log if x["nó"] != "native"]),
+            "wall_ms": state.get("wall_ms") or sum(phases.values()), "busca_ms": busca, "phases": phases,
+            "opcoes": len(state["top3"]), "ddg_queries": len(state["search_log"]),
+            "cache_hits": sum(1 for x in state["search_log"] if x.get("cache"))}
+
+
+def usd(v):
+    return "US$&nbsp;" + (f"{v:.4f}" if v < 0.1 else f"{v:.2f}").replace(".", ",")
+
+
+def brl2(v):
+    return "R$&nbsp;" + (f"{v:.3f}" if v < 0.1 else f"{v:.2f}").replace(".", ",")
+
+
+def secs(ms):
+    return f"{ms / 1000:.1f}<small>s</small>"
+
+
+def tiles(items):
+    h = '<div class="stats">'
+    for lbl, val, sub in items:
+        h += f'<div class="stat"><div class="lbl">{lbl}</div><div class="val">{val}</div>'
+        h += (f'<div class="score">{sub}</div>' if sub else "") + "</div>"
+    return h + "</div>"
 
 
 CSS = """<style>
@@ -789,6 +886,7 @@ ss.setdefault("messages", [])
 ss.setdefault("profile", {})
 ss.setdefault("top3", [])
 ss.setdefault("last_state", None)
+ss.setdefault("last_eff", None)
 
 
 def test_key(provider):
@@ -819,6 +917,28 @@ with st.sidebar:
         for k in ("messages", "profile", "top3", "last_state"):
             ss.pop(k, None)
         st.rerun()
+    with st.expander("💰 Custos e saldo"):
+        _m = model.strip() or DEFAULT_MODELS[provider]
+        _pi, _po = PRICES.get(_m, (0.0, 0.0))
+        pin = st.number_input("Preço entrada (US$/1M tokens)", min_value=0.0, value=float(_pi), step=0.01,
+                              format="%.3f", key=f"pin_{provider}_{_m}")
+        pout = st.number_input("Preço saída (US$/1M tokens)", min_value=0.0, value=float(_po), step=0.01,
+                               format="%.3f", key=f"pout_{provider}_{_m}")
+        if _m not in PRICES:
+            st.caption("⚠️ Modelo sem preço cadastrado: informe os valores acima para o custo ficar correto.")
+        fx = st.number_input("Cotação US$ → R$", min_value=0.0, value=5.50, step=0.05,
+                             help="Edite conforme a cotação do dia.")
+        _u = usage_load()
+        saldo = st.number_input(f"Saldo atual na {provider} (US$)", min_value=0.0, step=1.0,
+                                value=float(_u["budget"].get(provider, 0.0)),
+                                help="Copie do console de cobrança do provedor. O app desconta cada consulta a partir daí.")
+        if saldo != float(_u["budget"].get(provider, 0.0)):
+            _u["budget"][provider], _u["since"][provider] = saldo, time.time()
+            usage_save(_u)
+        if st.button("Zerar contador de gasto", use_container_width=True):
+            _u["since"][provider] = time.time()
+            usage_save(_u)
+            st.toast("Contador zerado")
     with st.expander("🔑 Diagnóstico das chaves"):
         for label, name, prov in (("OpenAI", "OPENAI_API_KEY", "OpenAI"), ("Claude", "ANTHROPIC_API_KEY", "Claude")):
             v, src = secret_info(name)
@@ -858,11 +978,13 @@ with box:
                 "provider": provider, "model": model.strip() or DEFAULT_MODELS[provider],
                 "cidade_default": cidade, "sites": sites or list(SITES)[:3], "attempt": 0,
                 "native_fb": native_fb, "native_used": False,
-                "raw": {}, "dropped": [], "cands": [], "queries": [], "search_log": [], "llm_log": [],
+                "ratelimit": {}, "raw": {}, "dropped": [], "cands": [], "queries": [], "search_log": [], "llm_log": [],
                 "trace": [], "errors": [], "reply": "", "intent": "", "missing": [],
             }
             with st.status("Trabalhando...", expanded=False) as status:
+                _t0 = time.perf_counter()
                 build_graph().run(state, on_step=lambda n: status.update(label=LABELS.get(n, n) + "..."))
+                state["wall_ms"] = round((time.perf_counter() - _t0) * 1000)
                 status.update(label="Pronto", state="error" if state["errors"] else "complete", expanded=False)
             st.markdown(state["reply"])
         ss.messages += [{"role": "user", "content": prompt}, {"role": "assistant", "content": state["reply"]}]
@@ -870,9 +992,15 @@ with box:
         if state["intent"] == "busca" and not state["missing"]:
             ss.top3 = state["top3"]
         ss.last_state = state
+        ss.last_eff = compute_eff(state, pin, pout)
+        _u = usage_load()
+        _u["runs"].append(ss.last_eff)
+        usage_save(_u)
+        if state.get("ratelimit"):
+            ss.setdefault("rate", {})[state["provider"]] = state["ratelimit"]
 
 with right:
-    tab_res, tab_dbg = st.tabs(["🏘️ Resultado", "🐞 Debug"])
+    tab_res, tab_dbg, tab_eff = st.tabs(["🏘️ Resultado", "🐞 Debug", "⚡ Eficiência"])
 
     with tab_res:
         with st.container(height=H):
@@ -912,3 +1040,66 @@ with right:
                 with t[5]:
                     st.json({"perfil": s["profile"], "intent": s["intent"], "faltando": s["missing"],
                              "tentativas": s["attempt"], "native_usada": s["native_used"]}, expanded=False)
+
+    with tab_eff:
+        with st.container(height=H):
+            import pandas as pd
+
+            e = ss.last_eff
+            st.markdown("##### Última consulta")
+            if not e:
+                st.markdown('<div class="empty">Faça uma busca para ver custo e tempo.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(tiles([
+                    ("Custo da consulta", usd(e["cost_usd"]), brl2(e["cost_usd"] * fx)),
+                    ("Tempo total", secs(e["wall_ms"]), f"{e['llm_calls']} chamada(s) de IA"),
+                    ("Tempo de busca", secs(e["busca_ms"]), "web + leitura dos anúncios"),
+                    ("Tokens", f"{e['tin'] + e['tout']:,}".replace(",", "."), f"{e['tin']:,} in · {e['tout']:,} out".replace(",", ".")),
+                    ("Busca nativa", f"{e['searches']}", usd(e["cost_search"]) + " em taxas"),
+                    ("Cache de buscas", f"{e['cache_hits']}/{e['ddg_queries']}", "queries sem custo/espera"),
+                ]), unsafe_allow_html=True)
+                st.caption(f"Modelo: {e['provider']} · {e['model']} · custo de tokens {usd(e['cost_tokens'])}".replace("&nbsp;", " "))
+                ph = e["phases"]
+                if ph:
+                    st.markdown("##### Onde o tempo foi gasto (ms)")
+                    st.bar_chart(pd.DataFrame({"ms": list(ph.values())}, index=list(ph.keys())), horizontal=True)
+
+            _u = usage_load()
+            since = _u["since"].get(provider, 0)
+            runs = [r for r in _u["runs"] if r["provider"] == provider and r["ts"] >= since]
+            allp = [r for r in _u["runs"] if r["provider"] == provider]
+            st.markdown(f"##### Acumulado · {provider}")
+            if runs:
+                gasto = sum(r["cost_usd"] for r in runs)
+                st.markdown(tiles([
+                    ("Consultas", f"{len(runs)}", f"{len(allp)} no histórico"),
+                    ("Gasto contabilizado", usd(gasto), brl2(gasto * fx)),
+                    ("Custo médio", usd(gasto / len(runs)), "por consulta"),
+                    ("Tempo médio", secs(sum(r["wall_ms"] for r in runs) / len(runs)), "por consulta"),
+                ]), unsafe_allow_html=True)
+                st.bar_chart(pd.DataFrame({"US$ por consulta": [r["cost_usd"] for r in runs[-20:]]}))
+            else:
+                gasto = 0.0
+                st.caption("Nenhuma consulta contabilizada para este provedor ainda.")
+
+            st.markdown(f"##### Saldo disponível · {provider}")
+            budget = float(_u["budget"].get(provider, 0.0))
+            if budget > 0:
+                resta = budget - gasto
+                st.markdown(tiles([
+                    ("Saldo estimado", usd(max(resta, 0)), brl2(max(resta, 0) * fx)),
+                    ("Saldo informado", usd(budget), "ponto de partida"),
+                    ("Consultas restantes", f"~{int(max(resta, 0) / (gasto / len(runs))):,}".replace(",", ".") if runs and gasto > 0 else "—",
+                     "pelo custo médio"),
+                ]), unsafe_allow_html=True)
+                if resta < budget * 0.1:
+                    st.warning("Saldo estimado abaixo de 10% do informado.")
+            else:
+                st.info("Informe seu saldo atual em **💰 Custos e saldo** (barra lateral). Até onde sei, OpenAI e "
+                        "Anthropic não expõem o saldo por chave de API: o app desconta o custo de cada consulta "
+                        "do valor que você informar. O saldo real fica no console de cobrança do provedor.")
+            rl = ss.get("rate", {}).get(provider)
+            if rl:
+                st.markdown("##### Limite de uso da API (janela atual)")
+                st.markdown(tiles([(k.capitalize(), str(v), "") for k, v in rl.items()]), unsafe_allow_html=True)
+                st.caption("Vem dos headers da última chamada; é o limite de taxa, não o saldo financeiro.")
