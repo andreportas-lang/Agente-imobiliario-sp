@@ -42,8 +42,15 @@ SITES = {
     "Imovelweb": "imovelweb.com.br",
     "Chaves na Mão": "chavesnamao.com.br",
     "OLX": "olx.com.br",
+    "Pilar Home": "pilarhome.com.br",  # domínio não verificado: confirme/edite na barra lateral
+    "Thura": "thura.com.br",  # domínio não verificado: confirme/edite na barra lateral
 }
 DEFAULT_MODELS = {"OpenAI": "gpt-4o-mini", "Claude": "claude-haiku-5-5"}
+MODEL_OPTIONS = {  # modelos oferecidos na lista (há também a opção "Outro" para digitar qualquer ID)
+    "OpenAI": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o"],
+    "Claude": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5"],
+}
+OTHER = "Outro (digitar ID)"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 CACHE_TTL = 3600
 # US$ por 1M de tokens (entrada, saída). Confira no site do provedor; dá para ajustar na barra lateral.
@@ -53,6 +60,9 @@ PRICES = {
     "claude-sonnet-5-5": (2.00, 10.00),
     "claude-opus-5-5": (4.00, 20.00),
     "claude-haiku-4-5": (1.00, 5.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4o": (2.50, 10.00),
 }
 SEARCH_FEE = 0.01  # US$ por busca web nativa (OpenAI e Anthropic: ~US$ 10 / 1.000 buscas)
 USAGE_FILE = Path(__file__).with_name("usage_log.json")
@@ -67,6 +77,8 @@ LISTING_RE = {
     "imovelweb.com.br": r"/propriedades/",
     "chavesnamao.com.br": r"/imovel/",
     "olx.com.br": r"-\d{7,}(?:[/?#]|$)",
+    "pilarhome.com.br": r"/imovel/|/(imoveis|apartamento|apartamentos|unidade|aluguel|locacao|venda)/[^?#]*\d{3,}",
+    "thura.com.br": r"/imovel/|/(imoveis|apartamento|apartamentos|unidade|aluguel|locacao|venda)/[^?#]*\d{3,}",
 }
 SITE_PATH = {"quintoandar.com.br": "/imovel", "loft.com.br": "/imovel", "vivareal.com.br": "/imovel",
              "zapimoveis.com.br": "/imovel", "chavesnamao.com.br": "/imovel", "imovelweb.com.br": "/propriedades"}
@@ -907,10 +919,19 @@ def test_key(provider):
 with st.sidebar:
     st.header("⚙️ Configurações")
     provider = st.radio("Provedor de IA", ["OpenAI", "Claude"], horizontal=True)
-    model = st.text_input("Modelo", DEFAULT_MODELS[provider], key=f"model_{provider}",
-                          help="Use um modelo rápido/barato; o grafo faz poucas chamadas por busca.")
+    _sel = st.selectbox(
+        "Modelo", MODEL_OPTIONS[provider] + [OTHER], key=f"modelsel_{provider}",
+        format_func=lambda m: (f"{m}  ·  US$ {PRICES[m][0]:g} / {PRICES[m][1]:g} por 1M" if m in PRICES else m),
+        help="Preços: entrada / saída por 1M de tokens. Modelos menores são mais baratos e rápidos.")
+    model = (st.text_input("ID do modelo", key=f"modelcustom_{provider}", placeholder="cole o ID exato do modelo")
+             if _sel == OTHER else _sel)
     cidade = st.text_input("Cidade padrão", "São Paulo")
     sites = st.multiselect("Sites", list(SITES), default=list(SITES)[:5])
+    with st.expander("🌐 Domínios dos sites"):
+        for _n in ("Tamaras", "Pilar Home", "Thura"):
+            _d = st.text_input(_n, SITES[_n], key=f"dom_{_n}")
+            SITES[_n] = re.sub(r"/.*$", "", re.sub(r"^(https?://)?(www\.)?", "", _d.strip().lower())) or SITES[_n]
+        st.caption("Domínios não verificados por mim. Se a busca não achar nada nesses sites, confirme o endereço oficial.")
     native_fb = st.toggle("Fallback: busca nativa da IA", value=True,
                           help="Usada se o DuckDuckGo falhar ou faltarem opções. ~US$ 0,01 por busca + tokens.")
     if st.button("🗑️ Nova conversa", use_container_width=True):
