@@ -37,12 +37,12 @@ SITES = {
     "QuintoAndar": "quintoandar.com.br",
     "Loft": "loft.com.br",
     "Viva Real": "vivareal.com.br",
-    "Tamaras": "tamaras.com.br",
+    "Tamaras": "maramores.com.br",
     "ZAP Imóveis": "zapimoveis.com.br",
     "Imovelweb": "imovelweb.com.br",
     "Chaves na Mão": "chavesnamao.com.br",
     "OLX": "olx.com.br",
-    "Pilar Home": "pilarhome.com.br",  # domínio não verificado: confirme/edite na barra lateral
+    "Pilar Home": "pilarhomes.com.br",
     "Thura": "thura.com.br",  # domínio não verificado: confirme/edite na barra lateral
 }
 DEFAULT_MODELS = {"OpenAI": "gpt-4o-mini", "Claude": "claude-haiku-5-5"}
@@ -77,8 +77,9 @@ LISTING_RE = {
     "imovelweb.com.br": r"/propriedades/",
     "chavesnamao.com.br": r"/imovel/",
     "olx.com.br": r"-\d{7,}(?:[/?#]|$)",
-    "pilarhome.com.br": r"/imovel/|/(imoveis|apartamento|apartamentos|unidade|aluguel|locacao|venda)/[^?#]*\d{3,}",
+    "pilarhomes.com.br": r"/imovel/|/(imoveis|apartamento|apartamentos|unidade|aluguel|locacao|venda)/[^?#]*\d{3,}",
     "thura.com.br": r"/imovel/|/(imoveis|apartamento|apartamentos|unidade|aluguel|locacao|venda)/[^?#]*\d{3,}",
+    "maramores.com.br": r"/imovel/|/(imoveis|casa|casas|apartamento|apartamentos|unidade|aluguel|locacao|venda)/[^?#]*\d{3,}",
 }
 SITE_PATH = {"quintoandar.com.br": "/imovel", "loft.com.br": "/imovel", "vivareal.com.br": "/imovel",
              "zapimoveis.com.br": "/imovel", "chavesnamao.com.br": "/imovel", "imovelweb.com.br": "/propriedades"}
@@ -362,9 +363,84 @@ def city_confirmed(c, p):
     return f"-{norm(p['cidade'])}-" in hay
 
 
+TIPO_PRIORIDADE = ["casa de vila", "casa de condomínio", "sobrado", "cobertura", "studio/kitnet", "apartamento", "casa",
+                   "terreno"]
+_TIPO_PAT = {
+    "casa de vila": r"casas?-(?:de|em|na|no)-vilas?|casas?-vilas?",
+    "casa de condomínio": r"casas?-(?:de|em)-condominios?|casas?-condominios?",
+    "sobrado": r"sobrados?",
+    "cobertura": r"coberturas?",
+    "studio/kitnet": r"kitnets?|kitchenettes?|studios?|estudios?|conjugados?",
+    "apartamento": r"apartamentos?|aptos?|apts?|flats?",
+    "casa": r"casas?",
+    "terreno": r"terrenos?|lotes?",
+}
+TIPO_RE = {k: re.compile(r"(?<![a-z0-9])(?:" + v + r")(?![a-z0-9])") for k, v in _TIPO_PAT.items()}
+TIPO_ACEITA = {
+    "casa de vila": {"casa de vila"}, "casa de condomínio": {"casa de condomínio"}, "sobrado": {"sobrado"},
+    "casa": {"casa", "casa de vila", "casa de condomínio", "sobrado"}, "apartamento": {"apartamento", "cobertura"},
+    "cobertura": {"cobertura"}, "studio/kitnet": {"studio/kitnet"}, "terreno": {"terreno"},
+}
+TIPO_SUB = {"casa de vila", "casa de condomínio", "sobrado"}
+TIPO_QUERY = {"studio/kitnet": "studio", "casa de condomínio": "casa em condomínio"}
+
+
+def canon_tipo(t):
+    n = "-" + norm(t) + "-"
+    if "casa" in n and "vila" in n:
+        return "casa de vila"
+    if "casa" in n and "condominio" in n:
+        return "casa de condomínio"
+    for key, rx in (("sobrado", r"sobrado"), ("cobertura", r"cobertura"), ("studio/kitnet", r"kitnet|studio|estudio|conjugado"),
+                    ("apartamento", r"apartamento|apto|flat"), ("casa", r"casa"), ("terreno", r"terreno|lote")):
+        if re.search(rx, n):
+            return key
+    return None
+
+
+def detect_tipos(c):
+    """Tipos citados no anúncio. Usa o primeiro campo que citar algum: caminho da URL > título > título da página > trecho."""
+    meta = c.get("meta") or {}
+    for field in (urlparse(c["url"]).path, c["titulo"], meta.get("title", ""), c["trecho"]):
+        t = "-" + norm(field) + "-"
+        found = {k for k, rx in TIPO_RE.items() if rx.search(t)}
+        if found:
+            return found
+    return set()
+
+
+def main_tipo(found):
+    return next((k for k in TIPO_PRIORIDADE if k in found), "")
+
+
+def tipo_status(c, p):
+    """ok | unknown | generic | mismatch. Define c['tipos'], c['tipo_ok'] e c['tipo_flag']."""
+    want, found = p.get("tipo"), detect_tipos(c)
+    c["tipos"], c["tipo_ok"], c["tipo_flag"] = sorted(found), False, ""
+    if not want:
+        return "ok"
+    if not found:
+        c["tipo_flag"] = f"Tipo não confirmado — verifique se é {want}"
+        return "unknown"
+    if want in TIPO_SUB:
+        if want in found:
+            c["tipo_ok"] = True
+            return "ok"
+        if found <= {"casa"}:
+            c["tipo_flag"] = f"O anúncio indica apenas “casa” — confirme se é {want}"
+            return "generic"
+        return "mismatch"
+    if found & TIPO_ACEITA.get(want, {want}):
+        c["tipo_ok"] = True
+        return "ok"
+    return "mismatch"
+
+
 def reject_reason(c, p, final=False):
     if c.get("dead"):
         return "anúncio fora do ar (404/410)"
+    if tipo_status(c, p) == "mismatch":
+        return f"tipo diferente do pedido ({main_tipo(set(c['tipos']))} ≠ {p['tipo']})"
     a, pr = c.get("area"), c.get("preco")
     min_area = int(p["area_m2"]) - AREA_TOL_DOWN
     if a and a < min_area:
@@ -412,6 +488,10 @@ def card_html(i, o, fin):
         f'<div class="score">Aderência ao pedido · <b>{score}%</b></div><div class="bar"><i style="width:{score}%"></i></div>',
         f'<div class="why">{e(o.get("motivo", ""))}</div>',
     ]
+    if o.get("tipo_detectado"):
+        parts.append(f'<div class="tags"><span class="pill">🏷️ {e(o["tipo_detectado"])}</span></div>')
+    if o.get("tipo_flag"):
+        parts.append(f'<div class="alert">⚠️ {e(o["tipo_flag"])}</div>')
     if not o.get("preco"):
         parts.append('<div class="warn">💲 Valor não identificado no anúncio — confirme no link.</div>')
     for a in o.get("alertas") or []:
@@ -484,6 +564,27 @@ def tiles(items):
     return h + "</div>"
 
 
+CART_FILE = Path(__file__).with_name("cart.json")
+
+
+def cart_load():
+    try:
+        return json.loads(CART_FILE.read_text())
+    except Exception:
+        return []
+
+
+def cart_save(items):
+    try:
+        CART_FILE.write_text(json.dumps(items, ensure_ascii=False))
+    except Exception:
+        pass  # filesystem somente leitura: o carrinho vale só na sessão (use o CSV para guardar)
+
+
+def cart_key(url):
+    return "cart_" + hashlib.md5(url.encode()).hexdigest()[:10]
+
+
 CSS = """<style>
 :root{--acc:#6366f1;--acc2:#0ea5e9;--line:rgba(128,128,128,.25);--soft:rgba(128,128,128,.07)}
 .block-container{padding-top:2.2rem;max-width:1400px}
@@ -507,6 +608,7 @@ CSS = """<style>
 .val small{font-size:.62em;font-weight:600;opacity:.75;margin-left:.1rem}
 .muted{font-weight:500;opacity:.55;font-size:.82rem}
 .score{font-size:.75rem;opacity:.75}
+.tags{margin:.3rem 0}
 .bar{height:6px;border-radius:99px;background:var(--line);overflow:hidden;margin:.25rem 0 .1rem}
 .bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),var(--acc2))}
 .why{font-size:.9rem;margin:.6rem 0 .3rem 0;line-height:1.45}
@@ -616,18 +718,20 @@ def n_extract(s):
         f"Mensagem do usuário: {msg}\n\n"
         "Retorne JSON com as chaves: intent ('busca' se o usuário informa/ajusta critérios ou pede nova busca; "
         "'conversa' se é dúvida/comentário sobre opções já mostradas), bairro, cidade, valor_max (número em reais; "
-        "'3 mil' = 3000), finalidade ('alugar' ou 'comprar' ou null), area_m2 (número), quartos (número), vagas (número), "
+        "'3 mil' = 3000), finalidade ('alugar' ou 'comprar' ou null), area_m2 (número), quartos (número), vagas (número), tipo ('apartamento', 'casa', 'casa de vila', 'sobrado', 'casa de condomínio', 'cobertura', 'studio/kitnet', 'terreno' ou null), "
         "extras (texto curto com outras preferências, ex: aceita pet, andar alto). Use null para o que não foi informado."
     )
     try:
         data = parse_json(llm(s, "extract", system, user, max_tokens=1500, as_json=True))
     except Exception as e:
         s["errors"].append(f"[extract] fallback regex ({e}){hint(e)}")
-        data = {"intent": "busca", "valor_max": first_price(msg), "area_m2": first_area(msg)}
+        data = {"intent": "busca", "valor_max": first_price(msg), "area_m2": first_area(msg), "tipo": canon_tipo(msg)}
     for k in ["bairro", "cidade", "valor_max", "finalidade", "area_m2", "quartos", "vagas", "extras"]:
         v = data.get(k)
         if v not in (None, "", 0):
             prof[k] = v
+    if canon_tipo(data.get("tipo")):
+        prof["tipo"] = canon_tipo(data["tipo"])
     if data.get("finalidade"):
         prof["_finalidade_inferida"] = False
     prof.setdefault("cidade", s["cidade_default"])
@@ -668,7 +772,8 @@ def n_queries(s):
         p["_finalidade_inferida"] = not p.get("finalidade")
     fin = p.get("finalidade") or ("alugar" if p["valor_max"] <= 20000 else "comprar")
     p["finalidade"] = fin
-    base = f"{fin} apartamento {p['bairro']} {p['cidade']}"
+    tq = TIPO_QUERY.get(p.get("tipo"), p.get("tipo") or "imóvel")  # antes era sempre "apartamento"
+    base = f"{fin} {tq} {p['bairro']} {p['cidade']}"
     extras = f" {int(p['quartos'])} quartos" if p.get("quartos") else ""
     qs = []
     for name in s["sites"]:
@@ -726,7 +831,7 @@ def n_native(s):
     system = ("Você é um assistente de busca imobiliária no Brasil. Use a ferramenta de busca web para achar anúncios "
               "REAIS nos sites indicados. Cada item deve ser a URL da página de UM imóvel específico (nunca página de "
               "busca, listagem, bairro ou home). Nunca invente URLs ou dados. Responda SOMENTE com JSON, sem texto extra.")
-    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nCidade: {p['cidade']} (somente imóveis nesta cidade). Área mínima: {min_area} m². "
+    user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\nCidade: {p['cidade']} (somente imóveis nesta cidade). Tipo: {p.get('tipo') or 'qualquer'}. Área mínima: {min_area} m². "
             f"Valor máximo: R$ {int(p['valor_max'])}.\nSites: {', '.join(domains)}\n\n"
             'Retorne até 8 anúncios: {"anuncios":[{"url":str,"titulo":str,"preco":number|null,'
             '"area_m2":number|null,"trecho":"resumo curto"}]}. Use null quando não souber.')
@@ -759,7 +864,7 @@ def n_rank(s):
             s["dropped"].append({"url": c["url"], "motivo": why})
             continue
         c["score"] = (2 * (bairro in (text + c["url"]).lower()) + 2 * bool(c["preco"]) + 2 * bool(c["area"])
-                      + (1 if c["area"] and c["area"] >= p["area_m2"] else 0))
+                      + (1 if c["area"] and c["area"] >= p["area_m2"] else 0) + (2 if c.get("tipo_ok") else 0))
         cands.append(c)
     cands.sort(key=lambda c: c["score"], reverse=True)
     s["cands"] = cands[:10]
@@ -805,12 +910,13 @@ def n_select(s):
         return "sem candidatos após os filtros"
     min_area = int(p["area_m2"]) - AREA_TOL_DOWN
     compact = [{"id": i, "fonte": c["fonte"], "titulo": c["titulo"][:120], "trecho": c["trecho"][:350],
-                "preco_detectado": c.get("preco"), "area_detectada": c.get("area")} for i, c in enumerate(pool)]
+                "preco_detectado": c.get("preco"), "area_detectada": c.get("area"),
+                "tipo_detectado": main_tipo(set(c.get("tipos", [])))} for i, c in enumerate(pool)]
     crit = {k: v for k, v in p.items() if not k.startswith("_")}
     system = ("Você é um corretor especialista. Escolha até 3 anúncios que melhor atendem aos critérios, SOMENTE entre "
               "os candidatos fornecidos. Nunca invente dados: use null quando não souber. Responda só JSON.")
     user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\n"
-            f"REGRAS: área mínima {min_area} m² (nunca escolha área menor); valor máximo R$ {int(p['valor_max'])}; cidade obrigatória: {p['cidade']}; "
+            f"REGRAS: área mínima {min_area} m² (nunca escolha área menor); valor máximo R$ {int(p['valor_max'])}; cidade obrigatória: {p['cidade']}; tipo obrigatório: {p.get('tipo') or 'qualquer'}; "
             "prefira anúncios com preço e área confirmados; se não aparecerem nos dados, use null.\n"
             f"Candidatos: {json.dumps(compact, ensure_ascii=False)}\n\n"
             'Formato: {"opcoes":[{"id":int,"titulo":str,"preco":number|null,"area_m2":number|null,"quartos":number|null,'
@@ -826,7 +932,8 @@ def n_select(s):
         preco = c.get("preco") or ok_price(num(o.get("preco")), p["finalidade"])
         if area and area < min_area:
             continue
-        out.append({**o, "preco": preco, "area_m2": area, "url": c["url"], "fonte": c["fonte"]})
+        out.append({**o, "preco": preco, "area_m2": area, "url": c["url"], "fonte": c["fonte"],
+                    "tipo_detectado": main_tipo(set(c.get("tipos", []))), "tipo_flag": c.get("tipo_flag", "")})
     s["top3"] = out
     return f"{len(out)} opções escolhidas"
 
@@ -849,7 +956,7 @@ def n_compose(s):
                       f"{brl(p['valor_max'])}. Tente ampliar o valor ou o bairro "
                       "(a aba **Debug** mostra o que foi descartado e por quê).")
         return "nenhuma opção"
-    s["reply"] = (f"Encontrei **{n} opç{'ão' if n == 1 else 'ões'}** em **{p['bairro']}/{p['cidade']}** para "
+    s["reply"] = (f"Encontrei **{n} opç{'ão' if n == 1 else 'ões'}**{(' de **' + p['tipo'] + '**') if p.get('tipo') else ''} em **{p['bairro']}/{p['cidade']}** para "
                   f"**{p['finalidade']}**, até {brl(p['valor_max'])} e **no mínimo {min_area} m²** "
                   f"(pedido: {int(p['area_m2'])} m², tolerância de {AREA_TOL_DOWN} m² abaixo). Detalhes ao lado →")
     sem_preco = sum(1 for o in s["top3"] if not o.get("preco"))
@@ -899,6 +1006,7 @@ ss.setdefault("profile", {})
 ss.setdefault("top3", [])
 ss.setdefault("last_state", None)
 ss.setdefault("last_eff", None)
+ss.setdefault("cart", cart_load())
 
 
 def test_key(provider):
@@ -931,7 +1039,7 @@ with st.sidebar:
         for _n in ("Tamaras", "Pilar Home", "Thura"):
             _d = st.text_input(_n, SITES[_n], key=f"dom_{_n}")
             SITES[_n] = re.sub(r"/.*$", "", re.sub(r"^(https?://)?(www\.)?", "", _d.strip().lower())) or SITES[_n]
-        st.caption("Domínios não verificados por mim. Se a busca não achar nada nesses sites, confirme o endereço oficial.")
+        st.caption("O domínio da Thura não foi verificado por mim. Se a busca não achar nada nos sites, confirme o endereço oficial.")
     native_fb = st.toggle("Fallback: busca nativa da IA", value=True,
                           help="Usada se o DuckDuckGo falhar ou faltarem opções. ~US$ 0,01 por busca + tokens.")
     if st.button("🗑️ Nova conversa", use_container_width=True):
@@ -971,6 +1079,33 @@ with st.sidebar:
         if st.button("Limpar cache de buscas", use_container_width=True):
             CACHE.clear()
             st.toast("Cache limpo")
+
+def toggle_cart(k, o):
+    """Callback do checkbox de cada card: adiciona/remove do carrinho e persiste."""
+    if ss.get(k):
+        if all(c["url"] != o["url"] for c in ss.cart):
+            pf = ss.profile
+            item = {f: o.get(f) for f in ("titulo", "fonte", "preco", "area_m2", "quartos", "aderencia", "motivo", "url",
+                                          "tipo_detectado", "tipo_flag")}
+            item.update({"finalidade": pf.get("finalidade"), "salvo_em": time.strftime("%d/%m %H:%M"),
+                         "busca": f"{pf.get('bairro', '')}/{pf.get('cidade', '')} · {pf.get('finalidade', '')}"})
+            ss.cart.append(item)
+    else:
+        ss.cart = [c for c in ss.cart if c["url"] != o["url"]]
+    cart_save(ss.cart)
+
+
+def remove_selected():
+    sel = set(ss.get("cart_rm", []))
+    ss.cart = [c for i, c in enumerate(ss.cart) if f"{i + 1}. {c['titulo'][:50]}" not in sel]
+    ss.cart_rm = []
+    cart_save(ss.cart)
+
+
+def clear_cart():
+    ss.cart, ss.cart_rm = [], []
+    cart_save([])
+
 
 st.markdown(CSS, unsafe_allow_html=True)
 st.markdown('<div class="hero"><div class="logo">🏠</div><div><h1>Agente Imobiliário</h1>'
@@ -1021,15 +1156,73 @@ with box:
             ss.setdefault("rate", {})[state["provider"]] = state["ratelimit"]
 
 with right:
-    tab_res, tab_dbg, tab_eff = st.tabs(["🏘️ Resultado", "🐞 Debug", "⚡ Eficiência"])
+    tab_res, tab_cart, tab_dbg, tab_eff = st.tabs(["🏘️ Resultado", "🛒 Carrinho", "🐞 Debug", "⚡ Eficiência"])
 
     with tab_res:
         with st.container(height=H):
             if not ss.top3:
                 st.markdown('<div class="empty">As 3 melhores opções aparecerão aqui.</div>', unsafe_allow_html=True)
             fin = ss.profile.get("finalidade")
+            in_cart = {c["url"] for c in ss.cart}
             for i, o in enumerate(ss.top3, 1):
                 st.markdown(card_html(i, o, fin), unsafe_allow_html=True)
+                _k = cart_key(o["url"])
+                ss[_k] = o["url"] in in_cart  # mantém o checkbox sincronizado com o carrinho
+                st.checkbox("🛒 Guardar no carrinho", key=_k, on_change=toggle_cart, args=(_k, o))
+                st.write("")
+
+    with tab_cart:
+        with st.container(height=H):
+            import pandas as pd
+
+            cart = ss.cart
+            st.markdown(f"##### Carrinho · {len(cart)} imóve{'l' if len(cart) == 1 else 'is'}")
+            if not cart:
+                st.markdown('<div class="empty">Marque “Guardar no carrinho” nos resultados para comparar depois.</div>',
+                            unsafe_allow_html=True)
+            else:
+                rows = []
+                for c in cart:
+                    pr, ar = c.get("preco"), c.get("area_m2")
+                    rows.append({"Imóvel": c["titulo"], "Site": c["fonte"], "Tipo": c.get("tipo_detectado") or "—",
+                                 "Preço": pr, "Área (m²)": ar, "R$/m²": round(pr / ar) if pr and ar else None,
+                                 "Quartos": c.get("quartos"), "Aderência": c.get("aderencia"), "Busca": c.get("busca"),
+                                 "Salvo em": c.get("salvo_em"), "Link": c["url"]})
+                df = pd.DataFrame(rows)
+                esc = lambda t: htmllib.escape(str(t)[:38])
+                best = []
+                for lbl, col, fn in (("Menor preço", "Preço", min), ("Maior área", "Área (m²)", max),
+                                     ("Menor R$/m²", "R$/m²", min)):
+                    ok = [(r[col], r["Imóvel"]) for r in rows if r[col]]
+                    if ok:
+                        v, t = fn(ok, key=lambda x: x[0])
+                        val = money_html(v, None) if col != "Área (m²)" else f"{v}<small>m²</small>"
+                        best.append((lbl, val, esc(t)))
+                if best:
+                    st.markdown(tiles(best), unsafe_allow_html=True)
+                st.caption("Compare preços apenas entre imóveis da mesma finalidade (aluguel x venda), conforme a coluna Busca.")
+                st.dataframe(df, hide_index=True, use_container_width=True, column_config={
+                    "Preço": st.column_config.NumberColumn(format="R$ %d"),
+                    "Área (m²)": st.column_config.NumberColumn(format="%d m²"),
+                    "R$/m²": st.column_config.NumberColumn(format="R$ %d"),
+                    "Aderência": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
+                    "Link": st.column_config.LinkColumn("Link", display_text="Abrir ↗"),
+                })
+                m2 = [(f"{i + 1}. {r['Imóvel'][:22]}", r["R$/m²"]) for i, r in enumerate(rows) if r["R$/m²"]]
+                if len(m2) > 1:
+                    st.markdown("##### R$ por m²")
+                    st.bar_chart(pd.DataFrame({"R$/m²": [v for _, v in m2]}, index=[k for k, _ in m2]))
+                with st.expander("Ver os cartões dos imóveis"):
+                    for i, c in enumerate(cart, 1):
+                        st.markdown(card_html(i, c, c.get("finalidade")), unsafe_allow_html=True)
+                st.multiselect("Remover do carrinho", [f"{i + 1}. {c['titulo'][:50]}" for i, c in enumerate(cart)],
+                               key="cart_rm")
+                b1, b2 = st.columns(2)
+                b1.button("Remover selecionados", on_click=remove_selected, use_container_width=True,
+                          disabled=not ss.get("cart_rm"))
+                b2.button("Limpar carrinho", on_click=clear_cart, use_container_width=True)
+                st.download_button("⬇️ Baixar comparação (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
+                                   "carrinho_imoveis.csv", "text/csv", use_container_width=True)
 
     with tab_dbg:
         with st.container(height=H):

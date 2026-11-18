@@ -1,9 +1,6 @@
-# Agente-imobiliario-sp
-Agente para consulta imobiliária e avaliação de opções
-
 # Agente Imobiliário (Streamlit + grafo de execução)
 
-App em Python que funciona como um corretor virtual. O usuário informa **bairro, valor e tamanho** do imóvel (e, opcionalmente, quartos, vagas, pet etc.). O agente busca anúncios em portais (QuintoAndar, Loft, Viva Real, Tamaras, ZAP, Imovelweb, Chaves na Mão, OLX e outros que encontrar na web) e devolve as **3 opções mais aderentes**, com link direto para o anúncio.
+App em Python que funciona como um corretor virtual. O usuário informa **bairro, valor e tamanho** do imóvel (e, opcionalmente, quartos, vagas, pet etc.). O agente busca anúncios em portais (QuintoAndar, Loft, Viva Real, Tamaras, ZAP, Imovelweb, Chaves na Mão, OLX, Pilar Home, Thura e outros que encontrar na web) e devolve as **3 opções mais aderentes**, com link direto para o anúncio.
 
 O provedor de IA pode ser **OpenAI** ou **Claude (Anthropic)**, escolhido na barra lateral.
 
@@ -16,6 +13,7 @@ O provedor de IA pode ser **OpenAI** ou **Claude (Anthropic)**, escolhido na bar
 | `app.py` | Todo o app: grafo, busca, filtros, chamadas de IA e interface |
 | `requirements.txt` | Dependências (`streamlit`, `openai`, `anthropic`, `requests`, `ddgs`) |
 | `usage_log.json` | Criado automaticamente. Guarda histórico de custos e saldo informado |
+| `cart.json` | Criado automaticamente. Guarda os imóveis do carrinho |
 
 ## 2. Como rodar
 
@@ -59,7 +57,7 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 
 | Nó | O que faz | Usa IA? |
 |---|---|---|
-| `extract` | Entende a mensagem e extrai bairro, cidade, valor máximo, finalidade (alugar/comprar), área, quartos, vagas e extras. Classifica a intenção: nova busca ou conversa sobre as opções atuais. Se a IA falhar, usa regex para valor e área | Sim (curta) |
+| `extract` | Entende a mensagem e extrai bairro, cidade, valor máximo, finalidade (alugar/comprar), **tipo do imóvel**, área, quartos, vagas e extras. Classifica a intenção: nova busca ou conversa sobre as opções atuais. Se a IA falhar, usa regex para valor e área | Sim (curta) |
 | `ask` | Se faltar bairro, valor ou tamanho, pergunta ao usuário | Não |
 | `answer` | Responde dúvidas sobre as opções já mostradas, sem nova busca | Sim |
 | `queries` | Monta as buscas por site (`site:dominio/imovel ...`) mais uma busca aberta na web. Na 1ª tentativa é estrita (inclui tamanho); na 2ª é relaxada (sem tamanho) | Não |
@@ -78,6 +76,7 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 - **Link exato:** só passam URLs de um imóvel específico (ex.: `/imovel/123...`). Páginas de busca ou listagem são descartadas. O link exibido vem sempre do anúncio real encontrado, nunca da IA.
 - **Área:** mínimo = área pedida − 10 m² (constante `AREA_TOL_DOWN`). Não há limite superior.
 - **Valor:** máximo = valor pedido + 10% (constante `PRICE_TOL`).
+- **Tipo de imóvel:** reconhece apartamento, casa, casa de vila, sobrado, casa de condomínio, cobertura, studio/kitnet e terreno. A busca usa o tipo pedido (sem tipo, busca "imóvel"). Anúncios de tipo diferente são descartados (ex.: apartamento numa busca por casa de vila). Se o anúncio indicar só "casa" (sem confirmar vila/sobrado/condomínio) ou não indicar o tipo, ele é mantido com um aviso no card.
 - **Cidade:** a cidade pedida precisa aparecer na URL, no título ou na descrição do anúncio. Senão é descartado como "cidade não confirmada".
 - **Anúncio fora do ar** (HTTP 404/410) é descartado.
 - **Preço plausível:** ignora condomínio e IPTU ao extrair o valor; ignora valores incoerentes com a finalidade (ex.: preço de venda numa busca de aluguel).
@@ -98,8 +97,8 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 ## 6. Interface
 
 **Barra lateral**
-- Provedor (OpenAI ou Claude) e nome do modelo (padrões: `gpt-4o-mini` e `claude-haiku-5-5`).
-- Cidade padrão e seleção de sites.
+- Provedor (OpenAI ou Claude) e **lista de seleção de modelos** (OpenAI: `gpt-4o-mini`, `gpt-4.1-mini`, `gpt-4.1`, `gpt-4o`; Claude: `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5`), com o preço por 1M de tokens ao lado. A opção *Outro (digitar ID)* aceita qualquer modelo. Padrões: `gpt-4o-mini` e `claude-haiku-5-5`.
+- Cidade padrão e seleção de sites (por padrão vêm marcados os 5 primeiros; Pilar Home e Thura estão disponíveis na lista). O bloco **🌐 Domínios dos sites** permite editar o endereço de Tamaras, Pilar Home e Thura.
 - Liga/desliga do fallback de busca nativa.
 - **Nova conversa**.
 - **💰 Custos e saldo:** preços por 1M de tokens (editáveis), cotação US$→R$ e saldo atual informado.
@@ -107,9 +106,10 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 
 **Esquerda:** conversa, com altura fixa e scroll próprio.
 
-**Direita (abas, mesma altura da conversa, com scroll):**
+**Direita (abas: Resultado, Carrinho, Debug e Eficiência; mesma altura da conversa, com scroll):**
 - **🏘️ Resultado** (padrão): até 3 cards com posição, site de origem, valor abreviado (ex.: R$ 1,1MM, R$ 850 mil), área, quartos, barra de aderência, motivo, alertas e botão "Abrir anúncio".
 - **🐞 Debug:** erros; trace do grafo com tempo por nó; chamadas de IA (prompt enviado, tokens, motivo da parada, resposta); buscas e erros; candidatos; descartados com motivo; estado.
+- **🛒 Carrinho:** cada card tem a opção *Guardar no carrinho*. O carrinho compara os imóveis salvos em tabela (preço, área, R$/m², quartos, aderência, link), destaca menor preço, maior área e menor R$/m², tem gráfico de R$/m², permite remover itens e exporta CSV. É salvo em `cart.json` (pode ser apagado quando o app reinicia no Streamlit Cloud; use o CSV como backup).
 - **⚡ Eficiência:**
   - *Última consulta:* custo (US$ e R$), tempo total, tempo de busca, tokens, buscas nativas, cache e gráfico de tempo por etapa.
   - *Acumulado do provedor:* consultas, gasto, custo e tempo médios, gráfico por consulta.
@@ -128,7 +128,8 @@ OpenAI e Anthropic, até onde sei, não informam o saldo financeiro por chave de
 
 | Constante | Significado |
 |---|---|
-| `SITES` | Portais disponíveis e seus domínios (confirme o domínio do Tamaras) |
+| `SITES` | Portais disponíveis e seus domínios (Tamaras = `maramores.com.br`, Pilar Home = `pilarhomes.com.br`; o domínio da Thura não foi verificado) |
+| `MODEL_OPTIONS` | Modelos exibidos na lista de seleção de cada provedor |
 | `DEFAULT_MODELS` | Modelo padrão de cada provedor |
 | `AREA_TOL_DOWN` | Tolerância de área abaixo do pedido (10 m²) |
 | `PRICE_TOL` | Tolerância de valor acima do pedido (10%) |
@@ -158,4 +159,3 @@ OpenAI e Anthropic, até onde sei, não informam o saldo financeiro por chave de
 | Timeout no DuckDuckGo | Reduza o número de sites, atualize `pip install -U ddgs` ou mantenha o fallback de busca nativa ligado |
 | Poucos resultados | Veja Debug > Descartados para entender os filtros; amplie valor, bairro ou tamanho |
 | Preços ou modelo sem custo | Informe os preços em *Custos e saldo* |
-
