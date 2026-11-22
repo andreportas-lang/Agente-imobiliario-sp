@@ -715,25 +715,30 @@ def site_name(url):
 
 
 def ddg(query, n=8):
+    """Busca no DuckDuckGo. 'No results found' = busca vazia (não é falha): devolve [] para o chamador tentar outra variante."""
     try:
         from ddgs import DDGS
     except ImportError:
         from duckduckgo_search import DDGS
-    last = None
-    for backend in ("auto", "bing"):  # se um backend der timeout/bloqueio, tenta o próximo
+    last, answered = None, False
+    for backend in ("auto", "bing"):  # se um backend vier vazio/der timeout, tenta o próximo
         try:
             with DDGS(timeout=10) as d:
                 try:
                     res = list(d.text(query, region="br-pt", max_results=n, backend=backend))
                 except TypeError:  # versão antiga da lib, sem parâmetro backend
                     res = list(d.text(query, region="br-pt", max_results=n))
+            answered = True
             if res:
                 return res
         except Exception as e:
+            if "no results" in str(e).lower():
+                answered = True
+                continue
             last = e
             time.sleep(1)
-    if last:
-        raise last
+    if last and not answered:
+        raise last  # só é erro se nenhum backend chegou a responder
     return []
 
 
@@ -847,41 +852,49 @@ def n_queries(s):
         p["_finalidade_inferida"] = not p.get("finalidade")
     fin = p.get("finalidade") or ("alugar" if p["valor_max"] <= 20000 else "comprar")
     p["finalidade"] = fin
-    tq = TIPO_QUERY.get(p.get("tipo"), p.get("tipo") or "imóvel")  # antes era sempre "apartamento"
+    tq = TIPO_QUERY.get(p.get("tipo"), p.get("tipo") or "imóvel")
     base = f"{fin} {tq} {p['bairro']} {p['cidade']}"
+    area, val = int(p["area_m2"]), int(p["valor_max"])
     extras = f" {int(p['quartos'])} quartos" if p.get("quartos") else ""
     qs = []
     for name in s["sites"]:
         dom = SITES[name]
-        site = f"site:{dom}{SITE_PATH.get(dom, '')}"  # foca em páginas de imóvel específico
-        qs.append((name, f"{site} {base} {int(p['area_m2'])} m²{extras}" if mode == 0 else f"{site} {base}"))
-    if mode == 0:
-        qs.append(("Web", f"{base} {int(p['area_m2'])} m² até R$ {int(p['valor_max'])}{extras}"))
-    else:
-        qs.append(("Web", f"imóvel {fin} {p['bairro']} {p['cidade']} até R$ {int(p['valor_max'])}"))
+        path = SITE_PATH.get(dom, "")
+        # variantes da mais específica para a mais simples: se uma vier vazia, tenta a próxima
+        v = ([f"site:{dom}{path} {base} {area} m2{extras}"] if mode == 0 else [])
+        v += [f"site:{dom}{path} {base}", f"site:{dom} {base}", f"{base} {name}"]
+        qs.append((name, list(dict.fromkeys(v))))
+    web = ([f"{base} {area} m2 até R$ {val}{extras}"] if mode == 0 else []) + [f"{base} até R$ {val}", f"{base} anúncio"]
+    qs.append(("Web", web))
     s["queries"] = qs
     s["attempt"] += 1
-    return f"{len(qs)} queries (modo {'relaxado' if mode else 'estrito'})"
+    return f"{len(qs)} buscas, até {max(len(v) for _, v in qs)} variantes cada (modo {'relaxado' if mode else 'estrito'})"
 
 
 def n_search(s):
     def one(item):
-        name, q = item
-        try:
-            res, hit = cached("ddg:" + q, lambda: ddg(q))
-            if not res:
-                CACHE.pop("ddg:" + q, None)  # não guarda busca vazia no cache
-            return name, q, res, hit, ""
-        except Exception as e:
-            return name, q, [], False, f"{type(e).__name__}: {str(e)[:120]}"
+        name, variants = item
+        res, log = [], []
+        for i, q in enumerate(variants):
+            try:
+                res, hit = cached("ddg:" + q, lambda q=q: ddg(q))
+                if not res:
+                    CACHE.pop("ddg:" + q, None)  # não guarda busca vazia no cache
+                log.append({"site": name, "tentativa": i + 1, "query": q, "resultados": len(res), "cache": hit, "erro": ""})
+                if res:
+                    break  # achou resultados: não precisa das variantes mais simples
+            except Exception as e:  # erro real (timeout/bloqueio): não insiste nesta busca
+                log.append({"site": name, "tentativa": i + 1, "query": q, "resultados": 0, "cache": False,
+                            "erro": f"{type(e).__name__}: {str(e)[:120]}"})
+                break
+        return res, log
 
     hits, errs = 0, []
     with cf.ThreadPoolExecutor(max_workers=3) as ex:
-        for name, q, res, hit, err in ex.map(one, s["queries"]):
-            hits += hit
-            if err:
-                errs.append(err)
-            s["search_log"].append({"query": q, "resultados": len(res), "cache": hit, "erro": err})
+        for res, log in ex.map(one, s["queries"]):
+            s["search_log"].extend(log)
+            hits += sum(1 for x in log if x["cache"])
+            errs += [x["erro"] for x in log if x["erro"]]
             for r in res:
                 url = r.get("href", "")
                 if url and url not in s["raw"]:
@@ -889,7 +902,7 @@ def n_search(s):
                                      "trecho": r.get("body", "")}
     if errs and not s["raw"] and not (s["native_fb"] and not s["native_used"]):
         raise RuntimeError(f"Todas as buscas falharam ({len(errs)}). Primeiro erro: {errs[0]}")
-    return f"{len(s['raw'])} URLs únicas ({hits} do cache, {len(errs)} falhas)"
+    return f"{len(s['raw'])} URLs únicas ({hits} do cache, {len(errs)} falhas, {len(s['search_log'])} tentativas)"
 
 
 def r_after_search(s):
