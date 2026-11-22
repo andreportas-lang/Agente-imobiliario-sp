@@ -64,7 +64,7 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 | `search` | Executa as buscas no DuckDuckGo em paralelo (3 simultâneas), com timeout, troca de backend e cache. Cada site tem **variantes** de busca, da mais específica para a mais simples; se uma vier vazia, tenta a próxima | Não |
 | `native` | **Fallback**: usa a busca web nativa do provedor (OpenAI ou Claude) para achar anúncios. Roda no máximo 1 vez por pedido | Sim (com busca paga) |
 | `rank` | Descarta o que não é anúncio específico, aplica filtros e pontua os candidatos. Mantém até 10 | Não |
-| `enrich` | Abre as páginas dos candidatos (em paralelo) para ler preço, área e título. Reaplica os filtros com os dados novos | Não |
+| `enrich` | Abre **todas** as páginas dos candidatos (em paralelo) para confirmar que o anúncio está no ar e ler preço, área e título. Reaplica os filtros com os dados novos | Não |
 | `select` | Uma chamada de IA que escolhe as 3 melhores entre os candidatos e escreve motivo e alertas | Sim |
 | `compose` | Monta a resposta final do chat | Não |
 | `fail` | Mensagem de erro amigável | Não |
@@ -78,7 +78,7 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 - **Valor:** máximo = valor pedido + 10% (constante `PRICE_TOL`).
 - **Tipo de imóvel:** reconhece apartamento, casa, casa de vila, sobrado, casa de condomínio, cobertura, studio/kitnet e terreno. A busca usa o tipo pedido (sem tipo, busca "imóvel"). Anúncios de tipo diferente são descartados (ex.: apartamento numa busca por casa de vila). Se o anúncio indicar só "casa" (sem confirmar vila/sobrado/condomínio) ou não indicar o tipo, ele é mantido com um aviso no card.
 - **Cidade:** a cidade pedida precisa aparecer na URL, no título ou na descrição do anúncio. Senão é descartado como "cidade não confirmada".
-- **Anúncio fora do ar** (HTTP 404/410) é descartado.
+- **Anúncio fora do ar:** o app abre cada candidato e descarta o que deu 404/410, o que responde "200 OK" com mensagem de *página não encontrada/anúncio expirado/indisponível* e o que redireciona para uma página de busca ou home (comum em ZAP e Viva Real). Anúncios confirmados no ar recebem o selo ✅ e passam na frente no ranking; se houver 3 ou mais confirmados, os não verificados ficam de fora. Alguns sites bloqueiam a checagem automática (403/anti-robô): nesses casos o anúncio pode aparecer sem confirmação, com um aviso no card.
 - **Preço plausível:** ignora condomínio e IPTU ao extrair o valor; ignora valores incoerentes com a finalidade (ex.: preço de venda numa busca de aluguel).
 - **Sem valor ou área:** o card mostra "Não informado" ou "Não confirmada" e um aviso. A resposta do chat informa quantas opções vieram sem valor.
 - **Finalidade:** se o usuário não disser, é inferida pelo valor (até R$ 20 mil = aluguel; acima = compra) e isso é avisado na resposta.
@@ -120,7 +120,7 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 
 Vale para imóveis **à venda**. Para aluguel, a janela mostra só o aluguel mensal e o de 12 meses.
 
-Entradas: valor do imóvel (editável, útil para simular negociação ou quando o anúncio não traz preço) e valor da entrada. Premissas editáveis: prazo do financiamento (5 a 35 anos), prazo do consórcio, mês estimado de contemplação, % financiado (padrão 80%), ITBI + escritura/registro (padrão 4,5%), desconto à vista, seguros, tarifa de avaliação, taxa mensal do contrato, TR estimada, seguro do consórcio e reajuste anual do consórcio (INCC/IPCA).
+Entradas: valor do imóvel (editável, útil para simular negociação ou quando o anúncio não traz preço) e valor da entrada. Premissas editáveis: prazo do financiamento (5 a 35 anos), **amortização extra anual fixa** (R$/ano, paga no 12º mês de cada ano sobre o saldo devedor, com efeito *reduzir prazo* ou *reduzir parcela*; vale só para o financiamento e mostra prazo final e economia em relação ao financiamento sem amortização), prazo do consórcio, mês estimado de contemplação, % financiado (padrão 80%), ITBI + escritura/registro (padrão 4,5%), desconto à vista, seguros, tarifa de avaliação, taxa mensal do contrato, TR estimada, seguro do consórcio e reajuste anual do consórcio (INCC/IPCA).
 
 Cenários calculados e comparados:
 - **À vista:** valor com desconto + custos de aquisição; mostra quanto falta em relação à entrada informada.

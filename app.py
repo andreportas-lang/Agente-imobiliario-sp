@@ -438,7 +438,7 @@ def tipo_status(c, p):
 
 def reject_reason(c, p, final=False):
     if c.get("dead"):
-        return "anúncio fora do ar (404/410)"
+        return "anúncio fora do ar (404, expirado ou redirecionado)"
     if tipo_status(c, p) == "mismatch":
         return f"tipo diferente do pedido ({main_tipo(set(c['tipos']))} ≠ {p['tipo']})"
     a, pr = c.get("area"), c.get("preco")
@@ -488,8 +488,16 @@ def card_html(i, o, fin):
         f'<div class="score">Aderência ao pedido · <b>{score}%</b></div><div class="bar"><i style="width:{score}%"></i></div>',
         f'<div class="why">{e(o.get("motivo", ""))}</div>',
     ]
+    pills = []
     if o.get("tipo_detectado"):
-        parts.append(f'<div class="tags"><span class="pill">🏷️ {e(o["tipo_detectado"])}</span></div>')
+        pills.append(f'<span class="pill">🏷️ {e(o["tipo_detectado"])}</span>')
+    if o.get("verificado"):
+        pills.append('<span class="pill">✅ anúncio confirmado no ar</span>')
+    if pills:
+        parts.append('<div class="tags">' + " ".join(pills) + "</div>")
+    if o.get("verificado") is False:
+        parts.append('<div class="alert">⚠️ Não consegui confirmar se o anúncio ainda está no ar (o site bloqueia a checagem '
+                     'automática). Se abrir “página não encontrada”, ele já saiu do ar.</div>')
     if o.get("tipo_flag"):
         parts.append(f'<div class="alert">⚠️ {e(o["tipo_flag"])}</div>')
     if not o.get("preco"):
@@ -610,21 +618,36 @@ def annualize(r_month):
     return ((1 + r_month) ** 12 - 1) * 100
 
 
-def fin_calc(pv, n, taxa_aa, sistema, seg_pct_m, adm_m, tarifa):
-    """Financiamento SAC ou Price. Taxa nominal a.a. (parcelas mensais com juros = taxa/12). Retorna resumo."""
+def fin_calc(pv, n, taxa_aa, sistema, seg_pct_m, adm_m, tarifa, extra_aa=0.0, modo="prazo"):
+    """Financiamento SAC ou Price (taxa nominal a.a.; juros mensais = taxa/12).
+    extra_aa: amortização extra fixa, paga no 12º mês de cada ano sobre o saldo devedor.
+    modo: "prazo" (mantém a parcela e quita antes) ou "parcela" (mantém o prazo e reduz a parcela)."""
     i = taxa_aa / 100 / 12
-    pmt = (pv * i / (1 - (1 + i) ** -n)) if (sistema == "Price" and i > 0) else pv / n
-    saldo, parcelas, juros_tot, seg_tot = pv, [], 0.0, 0.0
-    for _ in range(n):
+    amort_fix = pv / n
+    pmt = (pv * i / (1 - (1 + i) ** -n)) if i > 0 else pv / n
+    saldo, parcelas, extras, juros_tot, seg_tot = pv, [], [], 0.0, 0.0
+    for t in range(1, n + 1):
+        if saldo <= 0.005:
+            break
         juros, seg = saldo * i, saldo * seg_pct_m / 100
-        amort = pv / n if sistema == "SAC" else pmt - juros
+        amort = amort_fix if sistema == "SAC" else pmt - juros
+        amort = saldo if t >= n else min(amort, saldo)
         parcelas.append(amort + juros + seg + adm_m)
         juros_tot += juros
         seg_tot += seg
         saldo -= amort
-    flows = [(0, pv - tarifa)] + [(t + 1, -p) for t, p in enumerate(parcelas)]
-    return {"primeira": parcelas[0], "ultima": parcelas[-1], "total_parcelas": sum(parcelas), "juros": juros_tot,
-            "seguros": seg_tot + adm_m * n, "cet": annualize(irr_monthly(flows))}
+        if extra_aa > 0 and t % 12 == 0 and saldo > 0.005 and t < n:
+            ex = min(extra_aa, saldo)
+            saldo -= ex
+            extras.append((t, ex))
+            if modo == "parcela" and saldo > 0.005:  # recalcula a parcela para o prazo restante
+                rem = n - t
+                amort_fix = saldo / rem
+                pmt = (saldo * i / (1 - (1 + i) ** -rem)) if i > 0 else saldo / rem
+    flows = [(0, pv - tarifa)] + [(k + 1, -x) for k, x in enumerate(parcelas)] + [(t, -ex) for t, ex in extras]
+    return {"primeira": parcelas[0], "ultima": parcelas[-1], "total_parcelas": sum(parcelas),
+            "extras": sum(ex for _, ex in extras), "juros": juros_tot, "seguros": seg_tot + adm_m * len(parcelas),
+            "meses": len(parcelas), "cet": annualize(irr_monthly(flows))}
 
 
 def cons_calc(carta, n, adm_pct, fr_pct, seg_pct_m, mes_cont):
@@ -750,10 +773,21 @@ JSON_AREA = [re.compile(x, re.I) for x in (
     r'itemprop="floorSize"[^>]*content="(\d{2,4})')]
 
 
+SOFT404 = ("pagina nao encontrada", "anuncio nao encontrado", "imovel nao encontrado", "nao esta mais disponivel",
+           "anuncio expirado", "anuncio indisponivel", "anuncio foi removido", "pagina nao existe", "nao encontramos",
+           "erro 404", "error 404", "imovel indisponivel", "anuncio desativado", "esta pagina nao foi encontrada")
+BLOCKED_HINTS = ("captcha", "just a moment", "access denied", "acesso negado", "are you a robot", "voce e humano")
+
+
 def fetch_meta(url):
-    r = requests.get(url, headers=UA, timeout=8)
-    out = {"status": r.status_code, "title": "", "desc": "", "preco": None, "area": None, "origem": ""}
-    if r.status_code >= 400:
+    """Abre o anúncio e verifica se está no ar. vivo=True (confirmado), False (404, expirado, redirecionado) ou None (bloqueado)."""
+    r = requests.get(url, headers=UA, timeout=8, allow_redirects=True)
+    out = {"status": r.status_code, "final_url": r.url, "title": "", "desc": "", "preco": None, "area": None,
+           "origem": "", "vivo": None}
+    if r.status_code in (404, 410):
+        out["vivo"] = False
+        return out
+    if r.status_code >= 400:  # 403/429/5xx: o site bloqueou a checagem; não dá para saber
         return out
     html = r.text[:700_000]
     title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
@@ -763,6 +797,13 @@ def fetch_meta(url):
     head = f"{out['title']} {out['desc']}"
     body = re.sub(r"<script.*?</script>|<style.*?</style>|<[^>]+>", " ", html, flags=re.S | re.I)
     body = re.sub(r"\s+", " ", body)[:3000]
+    probe = norm(f"{head} {body[:2500]}").replace("-", " ")
+    if any(h in probe for h in BLOCKED_HINTS):
+        return out  # página de verificação anti-robô
+    if any(x in probe for x in SOFT404):
+        out["vivo"] = False  # "200 OK" com mensagem de anúncio não encontrado/expirado
+        return out
+    out["vivo"] = bool(is_listing_url(r.url))  # redirecionou para busca/home = anúncio saiu do ar
     # ordem de confiança: título/descrição -> JSON embutido -> corpo da página
     pr = first_price(head)
     out["origem"] = "título/descrição" if pr else ""
@@ -960,21 +1001,25 @@ def n_rank(s):
 
 
 def n_enrich(s):
+    """Abre TODOS os candidatos: confirma que o anúncio está no ar e completa preço/área/cidade/tipo."""
     p = s["profile"]
-    todo = [c for c in s["cands"] if not (c.get("preco") and c.get("area") and city_confirmed(c, p)) and "meta" not in c]
+    todo = [c for c in s["cands"] if "meta" not in c]
 
     def one(c):
         try:
-            meta, _ = cached("meta2:" + c["url"], lambda: fetch_meta(c["url"]))
+            meta, _ = cached("meta3:" + c["url"], lambda: fetch_meta(c["url"]))
             return c, meta
         except Exception as e:
-            return c, {"erro": str(e)[:80]}
+            return c, {"erro": str(e)[:80], "vivo": None}
 
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         for c, meta in ex.map(one, todo):
             c["meta"] = meta
-            if meta.get("status") in (404, 410):
+            if meta.get("vivo") is False:
                 c["dead"] = True
+            c["verificado"] = meta.get("vivo") is True
+            if c["verificado"] and meta.get("final_url"):
+                c["url_final"] = meta["final_url"]  # link já resolvido (sem redirecionamentos)
             c["preco"] = c.get("preco") or ok_price(meta.get("preco"), p["finalidade"])
             c["area"] = c.get("area") or meta.get("area")
             c["trecho"] = (c["trecho"] + " " + meta.get("desc", ""))[:500]
@@ -984,28 +1029,35 @@ def n_enrich(s):
         if why:
             s["dropped"].append({"url": c["url"], "motivo": why})
         else:
+            c["score"] = c.get("score", 0) + (3 if c.get("verificado") else 0)  # verificados primeiro
             keep.append(c)
+    keep.sort(key=lambda c: c["score"], reverse=True)
     s["cands"] = keep
     ok = sum(1 for c in todo if "erro" not in c["meta"] and c["meta"].get("status", 0) < 400)
-    return f"{ok}/{len(todo)} páginas lidas; {len(keep)} candidatos após filtros"
+    ver = sum(1 for c in keep if c.get("verificado"))
+    return f"{ok}/{len(todo)} páginas lidas; {ver} confirmadas no ar; {len(keep)} candidatos após filtros"
 
 
 def n_select(s):
     p = s["profile"]
     pool = s["cands"]
+    ver = [c for c in pool if c.get("verificado")]
+    if len(ver) >= 3:  # havendo 3+ anúncios confirmados no ar, os não verificados ficam de fora
+        pool = ver
     if not pool:
         s["top3"] = []
         return "sem candidatos após os filtros"
     min_area = int(p["area_m2"]) - AREA_TOL_DOWN
     compact = [{"id": i, "fonte": c["fonte"], "titulo": c["titulo"][:120], "trecho": c["trecho"][:350],
                 "preco_detectado": c.get("preco"), "area_detectada": c.get("area"),
-                "tipo_detectado": main_tipo(set(c.get("tipos", [])))} for i, c in enumerate(pool)]
+                "tipo_detectado": main_tipo(set(c.get("tipos", []))), "verificado": bool(c.get("verificado"))}
+               for i, c in enumerate(pool)]
     crit = {k: v for k, v in p.items() if not k.startswith("_")}
     system = ("Você é um corretor especialista. Escolha até 3 anúncios que melhor atendem aos critérios, SOMENTE entre "
               "os candidatos fornecidos. Nunca invente dados: use null quando não souber. Responda só JSON.")
     user = (f"Critérios: {json.dumps(crit, ensure_ascii=False)}\n"
             f"REGRAS: área mínima {min_area} m² (nunca escolha área menor); valor máximo R$ {int(p['valor_max'])}; cidade obrigatória: {p['cidade']}; tipo obrigatório: {p.get('tipo') or 'qualquer'}; "
-            "prefira anúncios com preço e área confirmados; se não aparecerem nos dados, use null.\n"
+            "prefira anúncios com verificado=true (confirmados no ar) e com preço e área confirmados; se não aparecerem nos dados, use null.\n"
             f"Candidatos: {json.dumps(compact, ensure_ascii=False)}\n\n"
             'Formato: {"opcoes":[{"id":int,"titulo":str,"preco":number|null,"area_m2":number|null,"quartos":number|null,'
             '"aderencia":0-100,"motivo":"1-2 frases","alertas":["divergências com o pedido"]}]} ordenado por aderência.')
@@ -1020,7 +1072,7 @@ def n_select(s):
         preco = c.get("preco") or ok_price(num(o.get("preco")), p["finalidade"])
         if area and area < min_area:
             continue
-        out.append({**o, "preco": preco, "area_m2": area, "url": c["url"], "fonte": c["fonte"],
+        out.append({**o, "preco": preco, "area_m2": area, "url": c.get("url_final") or c["url"], "fonte": c["fonte"], "verificado": bool(c.get("verificado")),
                     "tipo_detectado": main_tipo(set(c.get("tipos", []))), "tipo_flag": c.get("tipo_flag", "")})
     s["top3"] = out
     return f"{len(out)} opções escolhidas"
@@ -1174,7 +1226,7 @@ def toggle_cart(k, o):
         if all(c["url"] != o["url"] for c in ss.cart):
             pf = ss.profile
             item = {f: o.get(f) for f in ("titulo", "fonte", "preco", "area_m2", "quartos", "aderencia", "motivo", "url",
-                                          "tipo_detectado", "tipo_flag")}
+                                          "tipo_detectado", "tipo_flag", "verificado")}
             item.update({"finalidade": pf.get("finalidade"), "salvo_em": time.strftime("%d/%m %H:%M"),
                          "busca": f"{pf.get('bairro', '')}/{pf.get('cidade', '')} · {pf.get('finalidade', '')}"})
             ss.cart.append(item)
@@ -1184,7 +1236,7 @@ def toggle_cart(k, o):
 
 
 def pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itbi, desc, seg_f, tarifa, adm_m, tr,
-                  seg_c, incluir, inc_cons=0.0):
+                  seg_c, incluir, inc_cons=0.0, extra_aa=0.0, modo_am="prazo"):
     """Monta as linhas do comparativo: à vista, financiamento (SAC/Price por banco) e consórcio (por administradora)."""
     import pandas as pd
 
@@ -1192,7 +1244,7 @@ def pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itb
     preco_vista = preco * (1 - desc / 100)
     rows = [{"Opção": "À vista", "Detalhe": f"desconto de {desc:g}%" if desc else "pagamento integral",
              "Entrada": preco_vista, "1ª parcela": None, "Última": None, "Total": preco_vista + custos, "CET": None,
-             "Renda mín.": None, "Posse": "Imediata",
+             "Renda mín.": None, "Posse": "Imediata", "Prazo": "—", "Economia": None,
              "Alerta": f"Faltam {brl(preco_vista + custos - entrada)}" if entrada < preco_vista + custos else ""}]
     n_fin, ent_min = anos * 12, preco * (1 - cota / 100)
     ent_fin = max(entrada, ent_min)
@@ -1200,11 +1252,17 @@ def pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itb
         for _, b in banks.dropna(subset=["Banco", "Taxa a.a. (%)"]).iterrows():
             taxa = float(b["Taxa a.a. (%)"]) + tr
             for sis in ("SAC", "Price"):
-                r = fin_calc(preco - ent_fin, n_fin, taxa, sis, seg_f, adm_m, tarifa)
-                rows.append({"Opção": f"Financiamento {b['Banco']} · {sis}", "Detalhe": f"{taxa:.2f}% a.a. + TR · {anos} anos",
+                r = fin_calc(preco - ent_fin, n_fin, taxa, sis, seg_f, adm_m, tarifa, extra_aa, modo_am)
+                econ, det = None, f"{taxa:.2f}% a.a. + TR · {anos} anos"
+                if extra_aa > 0:  # compara com o mesmo financiamento sem a amortização extra
+                    r0 = fin_calc(preco - ent_fin, n_fin, taxa, sis, seg_f, adm_m, tarifa)
+                    econ = r0["total_parcelas"] - (r["total_parcelas"] + r["extras"])
+                    det += f" · amort. {brl(extra_aa)}/ano ({'reduz prazo' if modo_am == 'prazo' else 'reduz parcela'})"
+                rows.append({"Opção": f"Financiamento {b['Banco']} · {sis}", "Detalhe": det,
                              "Entrada": ent_fin, "1ª parcela": r["primeira"], "Última": r["ultima"],
-                             "Total": ent_fin + r["total_parcelas"] + tarifa + custos, "CET": r["cet"],
+                             "Total": ent_fin + r["total_parcelas"] + r["extras"] + tarifa + custos, "CET": r["cet"],
                              "Renda mín.": r["primeira"] / 0.30, "Posse": "Imediata",
+                             "Prazo": f"{r['meses'] / 12:.1f} anos".replace(".", ","), "Economia": econ,
                              "Alerta": f"Entrada ajustada ao mínimo ({brl(ent_min)})" if entrada < ent_min else ""})
     carta = preco - entrada
     if carta > 0:
@@ -1217,7 +1275,8 @@ def pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itb
                              "Entrada": entrada, "1ª parcela": r["parcela"], "Última": r["parcela"],
                              "Total": entrada + r["total"] + custos,
                              "CET": ((1 + r["cet"] / 100) * (1 + inc_cons / 100) - 1) * 100, "Renda mín.": r["parcela"] / 0.30,
-                             "Posse": f"~mês {r['mes']} (não garantido)", "Alerta": ""})
+                             "Posse": f"~mês {r['mes']} (não garantido)", "Prazo": f"{n / 12:.1f} anos".replace(".", ","),
+                             "Economia": None, "Alerta": ""})
     return rows
 
 
@@ -1317,6 +1376,13 @@ def pay_dialog(item):
         inc_cons = st.number_input("Reajuste anual do consórcio — INCC/IPCA (% a.a., estimativa)", 0.0, 20.0, 5.0, 0.5,
                                    key="pay_inccons", help="Parcelas e carta de crédito são corrigidas todo ano. Entra só no CET, "
                                                            "para comparar com o financiamento em termos nominais.")
+        g1, g2 = st.columns(2)
+        extra_aa = g1.number_input("Amortização extra anual — financiamento (R$/ano)", 0.0, 10_000_000.0, 0.0, 5000.0,
+                                   format="%.0f", key="pay_extra",
+                                   help="Valor fixo pago todo ano (no 12º mês) direto sobre o saldo devedor. Vale só para o financiamento.")
+        modo_am = g2.radio("Efeito da amortização", ["Reduzir prazo", "Reduzir parcela"], horizontal=True, key="pay_modo",
+                           help="Reduzir prazo: mantém a parcela e quita antes (economiza mais juros). "
+                                "Reduzir parcela: mantém o prazo e diminui a parcela.")
         incluir = st.checkbox("Incluir ITBI e escritura/registro no total", value=True, key="pay_inc")
 
     ss.setdefault("rates_banks", pd.DataFrame(BANKS_DEFAULT))
@@ -1342,7 +1408,7 @@ def pay_dialog(item):
                    "As taxas reais dependem do seu perfil, da renda e da entrada.")
 
     rows = pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itbi, desc, seg_f, tarifa, adm_m, tr,
-                         seg_c, incluir, inc_cons)
+                         seg_c, incluir, inc_cons, extra_aa, "prazo" if modo_am == "Reduzir prazo" else "parcela")
     if entrada >= preco:
         st.success("Sua entrada cobre o valor do imóvel: dá para comprar à vista.")
 
@@ -1360,12 +1426,15 @@ def pay_dialog(item):
         "1ª parcela": brl(r["1ª parcela"]) if r["1ª parcela"] else "—", "Última": brl(r["Última"]) if r["Última"] else "—",
         "Total pago": brl(r["Total"]), "Custo extra": brl(r["Total"] - preco),
         "CET a.a.": f"{r['CET']:.1f}%" if r["CET"] is not None else "—",
-        "Renda mín. (30%)": brl(r["Renda mín."]) if r["Renda mín."] else "—", "Posse": r["Posse"], "Alerta": r["Alerta"]}
+        "Renda mín. (30%)": brl(r["Renda mín."]) if r["Renda mín."] else "—", "Prazo": r.get("Prazo", "—"),
+        "Economia c/ amort.": brl(r["Economia"]) if r.get("Economia") else "—", "Posse": r["Posse"], "Alerta": r["Alerta"]}
         for r in sorted(rows, key=lambda r: r["Total"])])
+    if not any(r.get("Economia") for r in rows):
+        show = show.drop(columns=["Economia c/ amort."])
     st.dataframe(show, hide_index=True, use_container_width=True)
     st.bar_chart(pd.DataFrame({"Total pago (R$)": [r["Total"] for r in sorted(rows, key=lambda r: r["Total"])]},
                               index=[r["Opção"] for r in sorted(rows, key=lambda r: r["Total"])]), horizontal=True)
-    st.caption("Total pago = entrada + parcelas + tarifas + ITBI/escritura (se marcado), em valores de hoje, sem reajustes "
+    st.caption("Total pago = entrada + parcelas + amortizações extras + tarifas + ITBI/escritura (se marcado), em valores de hoje, sem reajustes "
                "futuros. Custo extra = total pago − valor do imóvel. CET aproximado (o do consórcio inclui o reajuste anual informado; o do financiamento usa a TR estimada). Consórcio não tem juros, mas tem taxa de "
                "administração, fundo de reserva e seguro, e a contemplação (lance ou sorteio) não é garantida. "
                "Simulação com taxas de referência: não substitui a proposta oficial nem aconselhamento financeiro. "
