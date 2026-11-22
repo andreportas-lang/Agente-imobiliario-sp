@@ -273,7 +273,7 @@ def llm_web(state, node, system, user, domains, max_tokens=4000):
             system=system,
             messages=[{"role": "user", "content": user}],
             tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3,
-                    "allowed_domains": domains}],
+                    **({"allowed_domains": domains} if domains else {})}],
         )
         text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
         nsearch = getattr(getattr(r.usage, "server_tool_use", None), "web_search_requests", 0) or 0
@@ -562,6 +562,81 @@ def tiles(items):
         h += f'<div class="stat"><div class="lbl">{lbl}</div><div class="val">{val}</div>'
         h += (f'<div class="score">{sub}</div>' if sub else "") + "</div>"
     return h + "</div>"
+
+
+# ---------------------------------------------------------------------------
+# Avaliação de pagamento (à vista, financiamento, consórcio)
+# ---------------------------------------------------------------------------
+RATES_DATE_DEFAULT = "out/2026 (reportagens)"
+BANKS_DEFAULT = [  # taxas mínimas nominais a.a. + TR; dependem de renda, relacionamento e entrada
+    {"Banco": "Caixa", "Taxa a.a. (%)": 10.26, "Obs": "mín. c/ relacionamento, jun/2026; reajuste não confirmado"},
+    {"Banco": "Banco do Brasil", "Taxa a.a. (%)": 11.60, "Obs": "mín., jun/2026; reajuste não confirmado"},
+    {"Banco": "Santander", "Taxa a.a. (%)": 12.49, "Obs": "reajuste de out/2026"},
+    {"Banco": "Itaú", "Taxa a.a. (%)": 12.95, "Obs": "reajuste de out/2026"},
+    {"Banco": "Bradesco", "Taxa a.a. (%)": 15.00, "Obs": "reajuste de out/2026"},
+]
+CONS_DEFAULT = [  # taxa de administração total; fundo de reserva típico de 1% a 3%
+    {"Administradora": "Caixa Consórcios", "Taxa adm. (%)": 18.0, "Prazo máx. (meses)": 200, "Fundo reserva (%)": 2.0},
+    {"Administradora": "Porto Seguro", "Taxa adm. (%)": 20.0, "Prazo máx. (meses)": 200, "Fundo reserva (%)": 2.0},
+    {"Administradora": "Ademicon", "Taxa adm. (%)": 18.0, "Prazo máx. (meses)": 180, "Fundo reserva (%)": 2.0},
+    {"Administradora": "Itaú", "Taxa adm. (%)": 19.0, "Prazo máx. (meses)": 200, "Fundo reserva (%)": 2.0},
+    {"Administradora": "Sicredi", "Taxa adm. (%)": 17.0, "Prazo máx. (meses)": 180, "Fundo reserva (%)": 2.0},
+]
+
+
+def _npv(flows, r):
+    return sum(cf / (1 + r) ** t for t, cf in flows)
+
+
+def irr_monthly(flows):
+    """Menor taxa mensal > 0 que zera o fluxo [(mês, valor)]. Varre uma grade e refina por bisseção
+    (o fluxo do consórcio tem várias trocas de sinal, então a bisseção direta não serve)."""
+    if _npv(flows, 0.0) >= 0:
+        return 0.0
+    prev = 0.0
+    for k in range(1, 401):  # até 20% ao mês, passos de 0,05%
+        r = k * 0.0005
+        if _npv(flows, r) >= 0:
+            lo, hi = prev, r
+            for _ in range(60):
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if _npv(flows, mid) < 0 else (lo, mid)
+            return (lo + hi) / 2
+        prev = r
+    return 0.0
+
+
+def annualize(r_month):
+    return ((1 + r_month) ** 12 - 1) * 100
+
+
+def fin_calc(pv, n, taxa_aa, sistema, seg_pct_m, adm_m, tarifa):
+    """Financiamento SAC ou Price. Taxa nominal a.a. (parcelas mensais com juros = taxa/12). Retorna resumo."""
+    i = taxa_aa / 100 / 12
+    pmt = (pv * i / (1 - (1 + i) ** -n)) if (sistema == "Price" and i > 0) else pv / n
+    saldo, parcelas, juros_tot, seg_tot = pv, [], 0.0, 0.0
+    for _ in range(n):
+        juros, seg = saldo * i, saldo * seg_pct_m / 100
+        amort = pv / n if sistema == "SAC" else pmt - juros
+        parcelas.append(amort + juros + seg + adm_m)
+        juros_tot += juros
+        seg_tot += seg
+        saldo -= amort
+    flows = [(0, pv - tarifa)] + [(t + 1, -p) for t, p in enumerate(parcelas)]
+    return {"primeira": parcelas[0], "ultima": parcelas[-1], "total_parcelas": sum(parcelas), "juros": juros_tot,
+            "seguros": seg_tot + adm_m * n, "cet": annualize(irr_monthly(flows))}
+
+
+def cons_calc(carta, n, adm_pct, fr_pct, seg_pct_m, mes_cont):
+    """Consórcio: parcela = (crédito + taxa adm + fundo de reserva)/prazo + seguro. CET considera a contemplação no mês informado."""
+    if carta <= 0 or n < 2:
+        return None
+    adm, fr = carta * adm_pct / 100, carta * fr_pct / 100
+    parcela = (carta + adm + fr) / n + carta * seg_pct_m / 100
+    m = min(max(int(mes_cont), 1), n - 1)
+    flows = [(m, carta)] + [(t, -parcela) for t in range(1, n + 1)]
+    return {"parcela": parcela, "total": parcela * n, "adm": adm, "fr": fr, "mes": m,
+            "cet": annualize(irr_monthly(flows))}
 
 
 CART_FILE = Path(__file__).with_name("cart.json")
@@ -1095,6 +1170,195 @@ def toggle_cart(k, o):
     cart_save(ss.cart)
 
 
+def pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itbi, desc, seg_f, tarifa, adm_m, tr,
+                  seg_c, incluir, inc_cons=0.0):
+    """Monta as linhas do comparativo: à vista, financiamento (SAC/Price por banco) e consórcio (por administradora)."""
+    import pandas as pd
+
+    custos = preco * itbi / 100 if incluir else 0.0
+    preco_vista = preco * (1 - desc / 100)
+    rows = [{"Opção": "À vista", "Detalhe": f"desconto de {desc:g}%" if desc else "pagamento integral",
+             "Entrada": preco_vista, "1ª parcela": None, "Última": None, "Total": preco_vista + custos, "CET": None,
+             "Renda mín.": None, "Posse": "Imediata",
+             "Alerta": f"Faltam {brl(preco_vista + custos - entrada)}" if entrada < preco_vista + custos else ""}]
+    n_fin, ent_min = anos * 12, preco * (1 - cota / 100)
+    ent_fin = max(entrada, ent_min)
+    if ent_fin < preco:
+        for _, b in banks.dropna(subset=["Banco", "Taxa a.a. (%)"]).iterrows():
+            taxa = float(b["Taxa a.a. (%)"]) + tr
+            for sis in ("SAC", "Price"):
+                r = fin_calc(preco - ent_fin, n_fin, taxa, sis, seg_f, adm_m, tarifa)
+                rows.append({"Opção": f"Financiamento {b['Banco']} · {sis}", "Detalhe": f"{taxa:.2f}% a.a. + TR · {anos} anos",
+                             "Entrada": ent_fin, "1ª parcela": r["primeira"], "Última": r["ultima"],
+                             "Total": ent_fin + r["total_parcelas"] + tarifa + custos, "CET": r["cet"],
+                             "Renda mín.": r["primeira"] / 0.30, "Posse": "Imediata",
+                             "Alerta": f"Entrada ajustada ao mínimo ({brl(ent_min)})" if entrada < ent_min else ""})
+    carta = preco - entrada
+    if carta > 0:
+        for _, c in cons.dropna(subset=["Administradora", "Taxa adm. (%)"]).iterrows():
+            pm, fr = c.get("Prazo máx. (meses)"), c.get("Fundo reserva (%)")
+            n = int(min(n_cons, pm if pd.notna(pm) and pm else n_cons))
+            r = cons_calc(carta, n, float(c["Taxa adm. (%)"]), float(fr) if pd.notna(fr) else 0.0, seg_c, mes_cont)
+            if r:
+                rows.append({"Opção": f"Consórcio {c['Administradora']}", "Detalhe": f"adm. {c['Taxa adm. (%)']:g}% · {n} meses",
+                             "Entrada": entrada, "1ª parcela": r["parcela"], "Última": r["parcela"],
+                             "Total": entrada + r["total"] + custos,
+                             "CET": ((1 + r["cet"] / 100) * (1 + inc_cons / 100) - 1) * 100, "Renda mín.": r["parcela"] / 0.30,
+                             "Posse": f"~mês {r['mes']} (não garantido)", "Alerta": ""})
+    return rows
+
+
+def refresh_rates(provider, model):
+    """Busca taxas atuais na web (busca nativa da IA, paga por busca) e atualiza as tabelas de referência."""
+    import pandas as pd
+
+    t0 = time.perf_counter()
+    mini = {"provider": provider, "model": model, "llm_log": [], "ratelimit": {}, "trace": [], "search_log": [],
+            "top3": []}
+    system = ("Você pesquisa condições ATUAIS de crédito imobiliário no Brasil usando a busca web. Nunca invente números: "
+              "omita o que não encontrar. Responda SOMENTE com JSON, sem texto extra.")
+    user = (f"Hoje é {time.strftime('%d/%m/%Y')}. Pesquise (1) as taxas mínimas atuais de financiamento imobiliário SBPE "
+            "(juros nominais ao ano, além da TR) de Caixa, Banco do Brasil, Santander, Itaú e Bradesco e (2) para consórcio "
+            "imobiliário a taxa de administração total (%), o prazo máximo (meses) e o fundo de reserva (%) de Caixa, "
+            'Porto Seguro, Ademicon, Itaú e Sicredi. Formato: {"data_ref":"mês/ano das fontes","bancos":[{"banco":str,'
+            '"taxa_aa":number,"obs":"fonte e mês"}],"consorcios":[{"administradora":str,"taxa_adm":number,'
+            '"prazo_max":number,"fundo_reserva":number}]}')
+    data = parse_json(llm_web(mini, "taxas", system, user, []))
+    banks, cons = [], []
+    for b in data.get("bancos", []):
+        try:
+            if 5 <= float(b["taxa_aa"]) <= 25:
+                banks.append({"Banco": str(b["banco"]), "Taxa a.a. (%)": float(b["taxa_aa"]), "Obs": str(b.get("obs", ""))[:80]})
+        except (KeyError, TypeError, ValueError):
+            pass
+    for c in data.get("consorcios", []):
+        try:
+            if 8 <= float(c["taxa_adm"]) <= 35:
+                cons.append({"Administradora": str(c["administradora"]), "Taxa adm. (%)": float(c["taxa_adm"]),
+                             "Prazo máx. (meses)": int(c.get("prazo_max") or 180),
+                             "Fundo reserva (%)": float(c.get("fundo_reserva") or 2.0)})
+        except (KeyError, TypeError, ValueError):
+            pass
+    if not banks and not cons:
+        raise RuntimeError("A busca não retornou taxas utilizáveis. Mantive as taxas anteriores.")
+    if banks:
+        ss.rates_banks = pd.DataFrame(banks)
+        ss.pop("ed_banks", None)
+    if cons:
+        ss.rates_cons = pd.DataFrame(cons)
+        ss.pop("ed_cons", None)
+    ss.rates_date = str(data.get("data_ref") or time.strftime("%m/%Y"))
+    mini["wall_ms"] = round((time.perf_counter() - t0) * 1000)
+    eff = compute_eff(mini, pin, pout)
+    eff["kind"] = "taxas"
+    u = usage_load()
+    u["runs"].append(eff)
+    usage_save(u)
+    return eff
+
+
+@st.dialog("💳 Avaliação de pagamento", width="large")
+def pay_dialog(item):
+    import pandas as pd
+
+    e = htmllib.escape
+    kx = cart_key(item["url"])
+    st.markdown(f"**{e(item['titulo'])}**  \n`{item['fonte']}` · {item.get('busca', '')}")
+    st.link_button("Abrir anúncio ↗", item["url"])
+    if item.get("finalidade") == "alugar":
+        st.info("Este imóvel é para **aluguel**. À vista, financiamento e consórcio se aplicam à compra.")
+        if item.get("preco"):
+            st.markdown(tiles([("Aluguel mensal", money_html(item["preco"], None), ""),
+                               ("Em 12 meses", money_html(item["preco"] * 12, None), "sem reajuste")]),
+                        unsafe_allow_html=True)
+        return
+
+    preco0 = float(item.get("preco") or 0)
+    c1, c2 = st.columns(2)
+    preco = c1.number_input("Valor do imóvel (R$)", min_value=0.0, value=preco0, step=10000.0, format="%.0f",
+                            key=f"{kx}_pv", help="Pode ajustar para simular uma negociação.")
+    entrada = c2.number_input("Valor de entrada (R$)", min_value=0.0, value=float(round(preco0 * 0.2)), step=5000.0,
+                              format="%.0f", key=f"{kx}_ent")
+    if preco <= 0:
+        st.warning("O anúncio não trouxe o valor. Informe o valor do imóvel acima para simular.")
+        return
+    st.caption(f"Entrada = {entrada / preco * 100:.1f}% do valor do imóvel.")
+
+    with st.expander("⚙️ Premissas (editáveis)"):
+        a1, a2, a3 = st.columns(3)
+        anos = a1.slider("Prazo do financiamento (anos)", 5, 35, 30, key="pay_anos")
+        n_cons = a2.slider("Prazo do consórcio (meses)", 60, 240, 180, step=12, key="pay_ncons")
+        mes_cont = a3.slider("Contemplação estimada (mês)", 1, 60, 12, key="pay_cont",
+                             help="Mês em que você recebe a carta de crédito (lance ou sorteio). Não é garantido.")
+        b1, b2, b3 = st.columns(3)
+        cota = b1.number_input("Financia até (% do imóvel)", 50.0, 100.0, 80.0, 5.0, key="pay_cota")
+        itbi = b2.number_input("ITBI + escritura/registro (%)", 0.0, 10.0, 4.5, 0.1, key="pay_itbi")
+        desc = b3.number_input("Desconto à vista (%)", 0.0, 30.0, 0.0, 0.5, key="pay_desc")
+        d1, d2, d3 = st.columns(3)
+        seg_f = d1.number_input("Seguros do financ. (% saldo/mês)", 0.0, 0.5, 0.035, 0.005, format="%.3f", key="pay_segf")
+        tarifa = d2.number_input("Avaliação e tarifas (R$)", 0.0, 20000.0, 3500.0, 100.0, key="pay_tar")
+        adm_m = d3.number_input("Taxa mensal do contrato (R$)", 0.0, 200.0, 25.0, 5.0, key="pay_admm")
+        f1, f2 = st.columns(2)
+        tr = f1.number_input("TR estimada (% a.a.)", 0.0, 10.0, 0.0, 0.1, key="pay_tr")
+        seg_c = f2.number_input("Seguro do consórcio (% crédito/mês)", 0.0, 0.2, 0.04, 0.005, format="%.3f", key="pay_segc")
+        inc_cons = st.number_input("Reajuste anual do consórcio — INCC/IPCA (% a.a., estimativa)", 0.0, 20.0, 5.0, 0.5,
+                                   key="pay_inccons", help="Parcelas e carta de crédito são corrigidas todo ano. Entra só no CET, "
+                                                           "para comparar com o financiamento em termos nominais.")
+        incluir = st.checkbox("Incluir ITBI e escritura/registro no total", value=True, key="pay_inc")
+
+    ss.setdefault("rates_banks", pd.DataFrame(BANKS_DEFAULT))
+    ss.setdefault("rates_cons", pd.DataFrame(CONS_DEFAULT))
+    ss.setdefault("rates_date", RATES_DATE_DEFAULT)
+    with st.expander(f"📊 Taxas de referência ({ss.rates_date})"):
+        if st.button("🔄 Atualizar taxas via web (IA)", help="Usa a busca nativa do provedor: ~US$ 0,01 por busca + tokens."):
+            try:
+                with st.spinner("Pesquisando taxas atuais..."):
+                    eff = refresh_rates(provider, (model.strip() or DEFAULT_MODELS[provider]))
+                st.success(f"Taxas atualizadas. Custo da atualização: ~{usd(eff['cost_usd'])} ({brl2(eff['cost_usd'] * fx)}).".replace("&nbsp;", " "))
+            except Exception as ex:
+                st.error(f"Não consegui atualizar: {type(ex).__name__}: {str(ex)[:200]}{hint(ex)}")
+        banks = st.data_editor(ss.rates_banks, num_rows="dynamic", hide_index=True, use_container_width=True, key="ed_banks",
+                               column_config={"Taxa a.a. (%)": st.column_config.NumberColumn(min_value=0.0, max_value=40.0,
+                                                                                            step=0.01, format="%.2f")})
+        cons = st.data_editor(ss.rates_cons, num_rows="dynamic", hide_index=True, use_container_width=True, key="ed_cons",
+                              column_config={"Taxa adm. (%)": st.column_config.NumberColumn(min_value=0.0, max_value=40.0, step=0.1),
+                                             "Prazo máx. (meses)": st.column_config.NumberColumn(min_value=12, max_value=300, step=12),
+                                             "Fundo reserva (%)": st.column_config.NumberColumn(min_value=0.0, max_value=10.0, step=0.5)})
+        st.caption("Financiamento: taxas mínimas (nominal a.a. + TR) em reportagens de out/2026 (Exame/MySide) e jun/2026; "
+                   "Caixa e Banco do Brasil podem ter reajustado depois. Consórcio: médias divulgadas pelo Serasa. "
+                   "As taxas reais dependem do seu perfil, da renda e da entrada.")
+
+    rows = pay_scenarios(preco, entrada, banks, cons, anos, n_cons, mes_cont, cota, itbi, desc, seg_f, tarifa, adm_m, tr,
+                         seg_c, incluir, inc_cons)
+    if entrada >= preco:
+        st.success("Sua entrada cobre o valor do imóvel: dá para comprar à vista.")
+
+    # ------------------------- resultado
+    st.markdown("##### Comparativo")
+    pool = [r for r in rows if r["Opção"] != "À vista"]
+    best = [("Menor custo total", min(rows, key=lambda r: r["Total"]), "Total")]
+    if pool:
+        best += [("Menor parcela inicial", min(pool, key=lambda r: r["1ª parcela"]), "1ª parcela"),
+                 ("Menor CET a.a.", min(pool, key=lambda r: r["CET"]), "CET")]
+    st.markdown(tiles([(lbl, (f"{r[k]:.1f}<small>%</small>" if k == "CET" else money_html(r[k], None)), e(r["Opção"]))
+                       for lbl, r, k in best]), unsafe_allow_html=True)
+    show = pd.DataFrame([{
+        "Opção": r["Opção"], "Detalhe": r["Detalhe"], "Entrada": brl(r["Entrada"]),
+        "1ª parcela": brl(r["1ª parcela"]) if r["1ª parcela"] else "—", "Última": brl(r["Última"]) if r["Última"] else "—",
+        "Total pago": brl(r["Total"]), "Custo extra": brl(r["Total"] - preco),
+        "CET a.a.": f"{r['CET']:.1f}%" if r["CET"] is not None else "—",
+        "Renda mín. (30%)": brl(r["Renda mín."]) if r["Renda mín."] else "—", "Posse": r["Posse"], "Alerta": r["Alerta"]}
+        for r in sorted(rows, key=lambda r: r["Total"])])
+    st.dataframe(show, hide_index=True, use_container_width=True)
+    st.bar_chart(pd.DataFrame({"Total pago (R$)": [r["Total"] for r in sorted(rows, key=lambda r: r["Total"])]},
+                              index=[r["Opção"] for r in sorted(rows, key=lambda r: r["Total"])]), horizontal=True)
+    st.caption("Total pago = entrada + parcelas + tarifas + ITBI/escritura (se marcado), em valores de hoje, sem reajustes "
+               "futuros. Custo extra = total pago − valor do imóvel. CET aproximado (o do consórcio inclui o reajuste anual informado; o do financiamento usa a TR estimada). Consórcio não tem juros, mas tem taxa de "
+               "administração, fundo de reserva e seguro, e a contemplação (lance ou sorteio) não é garantida. "
+               "Simulação com taxas de referência: não substitui a proposta oficial nem aconselhamento financeiro. "
+               "Confirme as condições com bancos e administradoras.")
+
+
 def remove_selected():
     sel = set(ss.get("cart_rm", []))
     ss.cart = [c for i, c in enumerate(ss.cart) if f"{i + 1}. {c['titulo'][:50]}" not in sel]
@@ -1201,13 +1465,27 @@ with right:
                 if best:
                     st.markdown(tiles(best), unsafe_allow_html=True)
                 st.caption("Compare preços apenas entre imóveis da mesma finalidade (aluguel x venda), conforme a coluna Busca.")
-                st.dataframe(df, hide_index=True, use_container_width=True, column_config={
+                ev = st.dataframe(df, hide_index=True, use_container_width=True, on_select="rerun",
+                                  selection_mode="single-row", key="cart_table", column_config={
                     "Preço": st.column_config.NumberColumn(format="R$ %d"),
                     "Área (m²)": st.column_config.NumberColumn(format="%d m²"),
                     "R$/m²": st.column_config.NumberColumn(format="R$ %d"),
                     "Aderência": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
                     "Link": st.column_config.LinkColumn("Link", display_text="Abrir ↗"),
                 })
+                sel = ev.selection.rows if ev else []
+                if sel and sel[0] < len(cart):
+                    _it = cart[sel[0]]
+                    if ss.get("pay_last") != _it["url"]:  # abre ao selecionar (e não reabre a cada rerun)
+                        ss.pay_last = _it["url"]
+                        pay_dialog(_it)
+                else:
+                    ss.pay_last = None
+                if st.button("💳 Avaliar pagamento do imóvel selecionado", disabled=not sel, use_container_width=True,
+                             key="btn_pay"):
+                    pay_dialog(cart[sel[0]])
+                if not sel:
+                    st.caption("Clique em uma linha da tabela para avaliar o pagamento (à vista, financiamento ou consórcio).")
                 m2 = [(f"{i + 1}. {r['Imóvel'][:22]}", r["R$/m²"]) for i, r in enumerate(rows) if r["R$/m²"]]
                 if len(m2) > 1:
                     st.markdown("##### R$ por m²")
@@ -1280,11 +1558,13 @@ with right:
 
             _u = usage_load()
             since = _u["since"].get(provider, 0)
-            runs = [r for r in _u["runs"] if r["provider"] == provider and r["ts"] >= since]
+            _since_runs = [r for r in _u["runs"] if r["provider"] == provider and r["ts"] >= since]
+            runs = [r for r in _since_runs if r.get("kind") != "taxas"]
+            extra_taxas = sum(r["cost_usd"] for r in _since_runs if r.get("kind") == "taxas")
             allp = [r for r in _u["runs"] if r["provider"] == provider]
             st.markdown(f"##### Acumulado · {provider}")
             if runs:
-                gasto = sum(r["cost_usd"] for r in runs)
+                gasto = sum(r["cost_usd"] for r in runs) + extra_taxas
                 st.markdown(tiles([
                     ("Consultas", f"{len(runs)}", f"{len(allp)} no histórico"),
                     ("Gasto contabilizado", usd(gasto), brl2(gasto * fx)),
@@ -1293,7 +1573,7 @@ with right:
                 ]), unsafe_allow_html=True)
                 st.bar_chart(pd.DataFrame({"US$ por consulta": [r["cost_usd"] for r in runs[-20:]]}))
             else:
-                gasto = 0.0
+                gasto = extra_taxas
                 st.caption("Nenhuma consulta contabilizada para este provedor ainda.")
 
             st.markdown(f"##### Saldo disponível · {provider}")

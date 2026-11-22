@@ -109,12 +109,29 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 **Direita (abas: Resultado, Carrinho, Debug e Eficiência; mesma altura da conversa, com scroll):**
 - **🏘️ Resultado** (padrão): até 3 cards com posição, site de origem, valor abreviado (ex.: R$ 1,1MM, R$ 850 mil), área, quartos, barra de aderência, motivo, alertas e botão "Abrir anúncio".
 - **🐞 Debug:** erros; trace do grafo com tempo por nó; chamadas de IA (prompt enviado, tokens, motivo da parada, resposta); buscas e erros; candidatos; descartados com motivo; estado.
-- **🛒 Carrinho:** cada card tem a opção *Guardar no carrinho*. O carrinho compara os imóveis salvos em tabela (preço, área, R$/m², quartos, aderência, link), destaca menor preço, maior área e menor R$/m², tem gráfico de R$/m², permite remover itens e exporta CSV. É salvo em `cart.json` (pode ser apagado quando o app reinicia no Streamlit Cloud; use o CSV como backup).
+- **🛒 Carrinho:** cada card tem a opção *Guardar no carrinho*. O carrinho compara os imóveis salvos em tabela (preço, área, R$/m², quartos, aderência, link), destaca menor preço, maior área e menor R$/m², tem gráfico de R$/m², permite remover itens e exporta CSV. **Ao clicar em uma linha da tabela, abre a janela de avaliação de pagamento** (veja a seção 6.1). É salvo em `cart.json` (pode ser apagado quando o app reinicia no Streamlit Cloud; use o CSV como backup).
 - **⚡ Eficiência:**
   - *Última consulta:* custo (US$ e R$), tempo total, tempo de busca, tokens, buscas nativas, cache e gráfico de tempo por etapa.
   - *Acumulado do provedor:* consultas, gasto, custo e tempo médios, gráfico por consulta.
   - *Saldo disponível:* saldo estimado, saldo informado e consultas restantes pelo custo médio.
   - *Limite de uso da API:* requisições e tokens restantes, lidos dos headers da última chamada.
+
+### 6.1 Avaliação de pagamento (janela aberta pelo carrinho)
+
+Vale para imóveis **à venda**. Para aluguel, a janela mostra só o aluguel mensal e o de 12 meses.
+
+Entradas: valor do imóvel (editável, útil para simular negociação ou quando o anúncio não traz preço) e valor da entrada. Premissas editáveis: prazo do financiamento (5 a 35 anos), prazo do consórcio, mês estimado de contemplação, % financiado (padrão 80%), ITBI + escritura/registro (padrão 4,5%), desconto à vista, seguros, tarifa de avaliação, taxa mensal do contrato, TR estimada, seguro do consórcio e reajuste anual do consórcio (INCC/IPCA).
+
+Cenários calculados e comparados:
+- **À vista:** valor com desconto + custos de aquisição; mostra quanto falta em relação à entrada informada.
+- **Financiamento** por banco (Caixa, Banco do Brasil, Santander, Itaú, Bradesco), em **SAC** e **Price**: 1ª e última parcela, total pago, custo extra sobre o valor do imóvel, **CET a.a.** e renda mínima (parcela ≤ 30% da renda). Se a entrada for menor que o mínimo exigido (100% − % financiado), ela é ajustada e isso é avisado.
+- **Consórcio** por administradora (Caixa, Porto Seguro, Ademicon, Itaú, Sicredi): crédito = valor do imóvel − entrada; parcela = (crédito + taxa de administração + fundo de reserva) / prazo + seguro. O CET considera a contemplação no mês informado e o reajuste anual. A posse do imóvel só ocorre após a contemplação, que **não é garantida** (lance ou sorteio).
+
+A janela destaca o menor custo total, a menor parcela inicial e o menor CET, e mostra tabela e gráfico do total pago.
+
+**Taxas de referência** (editáveis na própria janela): financiamento com taxas mínimas nominais a.a. + TR, segundo reportagens de out/2026 (Exame/MySide: Bradesco 15%, Itaú 12,95%, Santander 12,49%) e de jun/2026 (Caixa 10,26%, Banco do Brasil 11,60%; os dois podem ter reajustado depois). Consórcio: taxas de administração médias divulgadas pelo Serasa (17% a 20%) e fundo de reserva típico de 2%. O botão **Atualizar taxas via web (IA)** pesquisa valores atuais com a busca nativa do provedor (custo de ~US$ 0,01 por busca + tokens, registrado na aba Eficiência).
+
+Limites: valores em moeda de hoje, sem reajustes futuros; as taxas reais dependem de renda, score, relacionamento e entrada; é uma simulação, não substitui a proposta oficial nem aconselhamento financeiro.
 
 ### Sobre o saldo
 OpenAI e Anthropic, até onde sei, não informam o saldo financeiro por chave de API. O app desconta o custo de cada consulta do saldo que você digitar. É uma **estimativa** (só considera consultas feitas por este app). O saldo real fica no console de cobrança do provedor.
