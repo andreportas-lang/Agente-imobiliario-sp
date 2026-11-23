@@ -20,6 +20,7 @@ import html as htmllib
 import unicodedata
 from pathlib import Path
 import json
+import random
 import os
 import re
 import time
@@ -42,7 +43,7 @@ SITES = {
     "Imovelweb": "imovelweb.com.br",
     "Chaves na Mão": "chavesnamao.com.br",
     "OLX": "olx.com.br",
-    "Pilar Home": "pilarhomes.com.br",
+    "Pilar Homes": "pilarhomes.com.br",
     "Thura": "thura.com.br",  # domínio não verificado: confirme/edite na barra lateral
 }
 DEFAULT_MODELS = {"OpenAI": "gpt-4o-mini", "Claude": "claude-haiku-5-5"}
@@ -897,19 +898,24 @@ def n_queries(s):
     base = f"{fin} {tq} {p['bairro']} {p['cidade']}"
     area, val = int(p["area_m2"]), int(p["valor_max"])
     extras = f" {int(p['quartos'])} quartos" if p.get("quartos") else ""
+    names = list(s["sites"])
+    # até 4 sites: uma busca por site. Mais que isso: lotes de 3 sites com OR, para não estourar o limite do DuckDuckGo
+    groups = [[n] for n in names] if len(names) <= 4 else [names[i:i + 3] for i in range(0, len(names), 3)]
     qs = []
-    for name in s["sites"]:
-        dom = SITES[name]
-        path = SITE_PATH.get(dom, "")
+    for g in groups:
+        with_path = " OR ".join(f"site:{SITES[n]}{SITE_PATH.get(SITES[n], '')}" for n in g)
+        no_path = " OR ".join(f"site:{SITES[n]}" for n in g)
+        if len(g) > 1:
+            with_path, no_path = f"({with_path})", f"({no_path})"
         # variantes da mais específica para a mais simples: se uma vier vazia, tenta a próxima
-        v = ([f"site:{dom}{path} {base} {area} m2{extras}"] if mode == 0 else [])
-        v += [f"site:{dom}{path} {base}", f"site:{dom} {base}", f"{base} {name}"]
-        qs.append((name, list(dict.fromkeys(v))))
+        v = ([f"{with_path} {base} {area} m2{extras}"] if mode == 0 else [])
+        v += [f"{with_path} {base}", f"{no_path} {base}", f"{base} {' '.join(g)}"]
+        qs.append((" + ".join(g), list(dict.fromkeys(v))))
     web = ([f"{base} {area} m2 até R$ {val}{extras}"] if mode == 0 else []) + [f"{base} até R$ {val}", f"{base} anúncio"]
     qs.append(("Web", web))
     s["queries"] = qs
     s["attempt"] += 1
-    return f"{len(qs)} buscas, até {max(len(v) for _, v in qs)} variantes cada (modo {'relaxado' if mode else 'estrito'})"
+    return f"{len(qs)} buscas para {len(names)} sites, até {max(len(v) for _, v in qs)} variantes cada (modo {'relaxado' if mode else 'estrito'})"
 
 
 def n_search(s):
@@ -917,21 +923,28 @@ def n_search(s):
         name, variants = item
         res, log = [], []
         for i, q in enumerate(variants):
+            if s.get("ddg_down"):  # disjuntor: DuckDuckGo já deu timeout/bloqueio várias vezes nesta consulta
+                log.append({"site": name, "tentativa": i + 1, "query": q, "resultados": 0, "cache": False, "erro": "",
+                            "obs": "pulada: DuckDuckGo indisponível"})
+                break
             try:
-                res, hit = cached("ddg:" + q, lambda q=q: ddg(q))
+                res, hit = cached("ddg:" + q, lambda q=q: (time.sleep(random.uniform(0.2, 0.6)), ddg(q))[1])
                 if not res:
                     CACHE.pop("ddg:" + q, None)  # não guarda busca vazia no cache
                 log.append({"site": name, "tentativa": i + 1, "query": q, "resultados": len(res), "cache": hit, "erro": ""})
                 if res:
                     break  # achou resultados: não precisa das variantes mais simples
             except Exception as e:  # erro real (timeout/bloqueio): não insiste nesta busca
+                s["ddg_errs"] = s.get("ddg_errs", 0) + 1
+                if s["ddg_errs"] >= 2:
+                    s["ddg_down"] = True
                 log.append({"site": name, "tentativa": i + 1, "query": q, "resultados": 0, "cache": False,
                             "erro": f"{type(e).__name__}: {str(e)[:120]}"})
                 break
         return res, log
 
     hits, errs = 0, []
-    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+    with cf.ThreadPoolExecutor(max_workers=2) as ex:
         for res, log in ex.map(one, s["queries"]):
             s["search_log"].extend(log)
             hits += sum(1 for x in log if x["cache"])
@@ -941,9 +954,12 @@ def n_search(s):
                 if url and url not in s["raw"]:
                     s["raw"][url] = {"url": url, "fonte": site_name(url), "titulo": r.get("title", ""),
                                      "trecho": r.get("body", "")}
-    if errs and not s["raw"] and not (s["native_fb"] and not s["native_used"]):
-        raise RuntimeError(f"Todas as buscas falharam ({len(errs)}). Primeiro erro: {errs[0]}")
-    return f"{len(s['raw'])} URLs únicas ({hits} do cache, {len(errs)} falhas, {len(s['search_log'])} tentativas)"
+    s["search_errors"] = s.get("search_errors", []) + errs
+    rescue = s["native_fb"] and not s["native_used"]
+    if errs and not s["raw"] and not rescue:  # sem resultados e sem plano B: avisa, mas não derruba o fluxo
+        s["errors"].append(f"[search] DuckDuckGo falhou em {len(errs)} busca(s): {errs[0]}")
+    return (f"{len(s['raw'])} URLs únicas ({hits} do cache, {len(errs)} falhas, {len(s['search_log'])} tentativas"
+            f"{', DuckDuckGo indisponível' if s.get('ddg_down') else ''})")
 
 
 def r_after_search(s):
@@ -965,16 +981,20 @@ def n_native(s):
             'Retorne até 8 anúncios: {"anuncios":[{"url":str,"titulo":str,"preco":number|null,'
             '"area_m2":number|null,"trecho":"resumo curto"}]}. Use null quando não souber.')
     data = parse_json(llm_web(s, "native", system, user, domains))
-    n = 0
+    n, rejeitadas = 0, 0
     for a in data.get("anuncios", [])[:10]:
         url = str(a.get("url", ""))
-        if not url.startswith("http") or url in s["raw"] or not is_listing_url(url):
+        if not url.startswith("http") or url in s["raw"]:
+            continue
+        if not is_listing_url(url):
+            rejeitadas += 1
+            s["dropped"].append({"url": url, "motivo": "busca nativa: não é a página de um imóvel específico"})
             continue
         s["raw"][url] = {"url": url, "fonte": site_name(url), "titulo": str(a.get("titulo", ""))[:160],
                          "trecho": str(a.get("trecho") or "")[:350], "preco": num(a.get("preco")),
                          "area": num(a.get("area_m2"))}
         n += 1
-    return f"{n} anúncios via busca nativa ({s['provider']})"
+    return f"{n} anúncios via busca nativa ({s['provider']}); {rejeitadas} links descartados por não serem de um imóvel"
 
 
 def n_rank(s):
@@ -1081,8 +1101,8 @@ def n_select(s):
 def r_after_select(s):
     if len(s["top3"]) >= 3:
         return "compose"
-    if s["attempt"] < 2:
-        return "queries"  # 1ª tentativa insuficiente -> busca relaxada
+    if s["attempt"] < 2 and not s.get("ddg_down"):
+        return "queries"  # 1ª tentativa insuficiente -> busca relaxada (se o DuckDuckGo estiver respondendo)
     if s["native_fb"] and not s["native_used"]:
         return "native"  # ainda faltam opções -> busca nativa da IA (1x)
     return "compose"
@@ -1095,6 +1115,10 @@ def n_compose(s):
         s["reply"] = (f"Não encontrei anúncios específicos com **mínimo de {min_area} m²** e valor até "
                       f"{brl(p['valor_max'])}. Tente ampliar o valor ou o bairro "
                       "(a aba **Debug** mostra o que foi descartado e por quê).")
+        if s.get("search_errors"):
+            s["reply"] += ("\n\n⚠️ As buscas no DuckDuckGo falharam por timeout/bloqueio (comum em servidores de nuvem, "
+                           "principalmente com muitos sites marcados). Tente de novo em alguns minutos, marque menos sites e "
+                           "mantenha ligado o fallback de busca nativa da IA.")
         return "nenhuma opção"
     s["reply"] = (f"Encontrei **{n} opç{'ão' if n == 1 else 'ões'}**{(' de **' + p['tipo'] + '**') if p.get('tipo') else ''} em **{p['bairro']}/{p['cidade']}** para "
                   f"**{p['finalidade']}**, até {brl(p['valor_max'])} e **no mínimo {min_area} m²** "
@@ -1175,8 +1199,10 @@ with st.sidebar:
              if _sel == OTHER else _sel)
     cidade = st.text_input("Cidade padrão", "São Paulo")
     sites = st.multiselect("Sites", list(SITES), default=list(SITES)[:5])
+    if len(sites) > 4:
+        st.caption("ℹ️ Com mais de 4 sites, as buscas são agrupadas em lotes de 3 para evitar bloqueio do DuckDuckGo.")
     with st.expander("🌐 Domínios dos sites"):
-        for _n in ("Tamaras", "Pilar Home", "Thura"):
+        for _n in ("Tamaras", "Pilar Homes", "Thura"):
             _d = st.text_input(_n, SITES[_n], key=f"dom_{_n}")
             SITES[_n] = re.sub(r"/.*$", "", re.sub(r"^(https?://)?(www\.)?", "", _d.strip().lower())) or SITES[_n]
         st.caption("O domínio da Thura não foi verificado por mim. Se a busca não achar nada nos sites, confirme o endereço oficial.")

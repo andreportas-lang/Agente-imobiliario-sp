@@ -61,7 +61,7 @@ Qualquer erro em um nó desvia para o nó `fail`, que mostra uma mensagem amigá
 | `ask` | Se faltar bairro, valor ou tamanho, pergunta ao usuário | Não |
 | `answer` | Responde dúvidas sobre as opções já mostradas, sem nova busca | Sim |
 | `queries` | Monta as buscas por site (`site:dominio/imovel ...`) mais uma busca aberta na web. Na 1ª tentativa é estrita (inclui tamanho); na 2ª é relaxada (sem tamanho) | Não |
-| `search` | Executa as buscas no DuckDuckGo em paralelo (3 simultâneas), com timeout, troca de backend e cache. Cada site tem **variantes** de busca, da mais específica para a mais simples; se uma vier vazia, tenta a próxima | Não |
+| `search` | Executa as buscas no DuckDuckGo (2 simultâneas, com pequeno intervalo entre elas), com timeout, troca de backend e cache. Com mais de 4 sites, agrupa as buscas em lotes de 3 sites (operador OR) para fazer menos requisições. Um **disjuntor** interrompe as buscas após 2 timeouts seguidos e aciona o fallback de busca nativa. Cada site tem **variantes** de busca, da mais específica para a mais simples; se uma vier vazia, tenta a próxima | Não |
 | `native` | **Fallback**: usa a busca web nativa do provedor (OpenAI ou Claude) para achar anúncios. Roda no máximo 1 vez por pedido | Sim (com busca paga) |
 | `rank` | Descarta o que não é anúncio específico, aplica filtros e pontua os candidatos. Mantém até 10 | Não |
 | `enrich` | Abre **todas** as páginas dos candidatos (em paralelo) para confirmar que o anúncio está no ar e ler preço, área e título. Reaplica os filtros com os dados novos | Não |
@@ -174,6 +174,7 @@ OpenAI e Anthropic, até onde sei, não informam o saldo financeiro por chave de
 | Erro 401 | Chave recusada. Use *Diagnóstico das chaves* > *Testar chaves*; confira se a chave é do projeto certo e se há variável de ambiente antiga no Codespaces |
 | Resposta vazia da IA | O modelo gastou os tokens "pensando". Veja a aba Debug > LLM (motivo da parada) e aumente `max_tokens` ou troque o modelo |
 | `DDGSException: No results found` | Significa busca vazia (não é falha de rede). O app tenta variantes mais simples da busca e, se nada vier, aciona o fallback de busca nativa. Veja Debug > Descartados e a aba Buscas |
+| `TimeoutException` / "Todas as buscas falharam" | O DuckDuckGo está limitando ou bloqueando o servidor (comum em nuvem; piora com muitos sites marcados). O app não derruba mais o fluxo: usa o fallback de busca nativa e, sem ele, avisa na resposta. Marque menos sites, mantenha o fallback ligado e tente de novo em alguns minutos |
 | Timeout no DuckDuckGo | Reduza o número de sites, atualize `pip install -U ddgs` ou mantenha o fallback de busca nativa ligado |
 | Poucos resultados | Veja Debug > Descartados para entender os filtros; amplie valor, bairro ou tamanho |
 | Preços ou modelo sem custo | Informe os preços em *Custos e saldo* |
